@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <pistache/os.h>
+
 #include <cstddef>
 #include <stdexcept>
 #include <cstring>
@@ -13,8 +15,8 @@
 #include <vector>
 #include <limits>
 #include <iostream>
+#include <string>
 
-#include <pistache/os.h>
 
 namespace Pistache {
 
@@ -59,7 +61,6 @@ public:
         const CharT* gptr = this->gptr();
         return *(gptr + 1);
     }
-
 };
 
 template<typename CharT = char>
@@ -73,100 +74,78 @@ public:
     RawStreamBuf(char* begin, size_t len) {
         Base::setg(begin, begin, begin + len);
     }
-
 };
 
-template<size_t N, typename CharT = char>
+// Make the buffer dynamic
+template<typename CharT = char>
 class ArrayStreamBuf : public StreamBuf<CharT> {
 public:
     typedef StreamBuf<CharT> Base;
+    static size_t maxSize;
 
     ArrayStreamBuf()
-      : size(0)
+      : StreamBuf<CharT>()
+      , bytes()
     {
-        memset(bytes, 0, N);
-        Base::setg(bytes, bytes, bytes + N);
+        bytes.clear();
+        Base::setg(bytes.data(), bytes.data(), bytes.data() + bytes.size());
     }
 
     template<size_t M>
     ArrayStreamBuf(char (&arr)[M]) {
-        static_assert(M <= N, "Source array exceeds maximum capacity");
-        memcpy(bytes, arr, M);
-        size = M;
-        Base::setg(bytes, bytes, bytes + M);
+        bytes.clear();
+        std::copy(arr, arr + M, std::back_inserter(bytes));
+        Base::setg(bytes.data(), bytes.data(), bytes.data() + bytes.size());
     }
 
     bool feed(const char* data, size_t len) {
-        if (size + len >= N) {
-            return false;
-        }
-
-        memcpy(bytes + size, data, len);
-        CharT *cur = nullptr;
-        if (this->gptr()) {
-            cur = this->gptr();
-        } else {
-            cur = bytes + size;
-        }
-
-        Base::setg(bytes, cur, bytes + size + len);
-
-        size += len;
+        if (bytes.size() + len > maxSize) { return false; }
+        // persist current offset
+        size_t readOffset = static_cast<size_t>(this->gptr() - this->eback());
+        std::copy(data, data + len, std::back_inserter(bytes));
+        Base::setg(bytes.data()
+                  , bytes.data() + readOffset
+                  , bytes.data() + bytes.size());
         return true;
     }
 
     void reset() {
-        memset(bytes, 0, N);
-        size = 0;
-        Base::setg(bytes, bytes, bytes);
+        std::vector<CharT> nbytes;
+        bytes.swap(nbytes);
+        Base::setg(bytes.data(), bytes.data(), bytes.data() + bytes.size());
     }
 
 private:
-    char bytes[N];
-    size_t size;
+    std::vector<CharT> bytes;
 };
 
-struct Buffer {
-    Buffer()
-        : data(nullptr)
-        , len(0)
-        , isOwned(false)
-    { }
+template<typename CharT>
+size_t ArrayStreamBuf<CharT>::maxSize = Const::DefaultMaxPayload;
 
-    Buffer(const char * const data, size_t len, bool own = false)
-        : data(data)
-        , len(len)
-        , isOwned(own)
-    { }
+struct RawBuffer
+{
+    RawBuffer();
+    RawBuffer(std::string data, size_t length, bool isDetached = false);
+    RawBuffer(const char* data, size_t length, bool isDetached = false);
 
-    Buffer detach(size_t fromIndex = 0) const {
-        if (fromIndex > len)
-            throw std::invalid_argument("Invalid index (> len)");
-
-        size_t retainedLen = len - fromIndex;
-        char *newData = new char[retainedLen];
-        std::copy(data + fromIndex, data + len, newData);
-
-        return Buffer(newData, retainedLen, true);
-    }
-
-    const char* const data;
-    const size_t len;
-    const bool isOwned;
+    RawBuffer detach(size_t fromIndex);
+    const std::string& data() const;
+    size_t size() const;
+    bool isDetached() const;
+private:
+    std::string data_;
+    size_t length_;
+    bool isDetached_;
 };
 
-struct FileBuffer {
-    FileBuffer() { }
+struct FileBuffer
+{
+    explicit FileBuffer(const std::string& fileName);
 
-    FileBuffer(const char* fileName);
-    FileBuffer(const std::string& fileName);
-
-    std::string fileName() const { return fileName_; }
-    Fd fd() const { return fd_; }
-    size_t size() const { return size_; }
+    Fd fd() const;
+    size_t size() const;
 
 private:
-    void init(const char* fileName);
     std::string fileName_;
     Fd fd_;
     size_t size_;
@@ -183,6 +162,7 @@ public:
             size_t size,
             size_t maxSize = std::numeric_limits<uint32_t>::max())
         : maxSize_(maxSize)
+        , data_()
     {
         reserve(size);
     }
@@ -205,8 +185,8 @@ public:
         return *this;
     }
 
-    Buffer buffer() const {
-        return Buffer(data_.data(), pptr() - &data_[0]);
+    RawBuffer buffer() const {
+        return RawBuffer((const char*) data_.data(), pptr() - &data_[0]);
     }
 
     void clear() {
@@ -214,7 +194,7 @@ public:
         this->setp(&data_[0], &data_[0] + data_.capacity());
     }
 
-protected:
+  protected:
     int_type overflow(int_type ch);
 
 private:
@@ -226,8 +206,8 @@ private:
 
 class StreamCursor {
 public:
-    StreamCursor(StreamBuf<char>* buf, size_t initialPos = 0)
-        : buf(buf)
+    StreamCursor(StreamBuf<char>* _buf, size_t initialPos = 0)
+        : buf(_buf)
     {
         advance(initialPos);
     }
@@ -235,8 +215,8 @@ public:
     static constexpr int Eof = -1;
 
     struct Token {
-        Token(StreamCursor& cursor)
-            : cursor(cursor)
+        Token(StreamCursor& _cursor)
+            : cursor(_cursor)
             , position(cursor.buf->position())
             , eback(cursor.buf->begptr())
             , gptr(cursor.buf->curptr())
@@ -253,7 +233,7 @@ public:
             return end() - start();
         }
 
-        std::string text() {
+        std::string text() const {
             return std::string(gptr, size());
         }
 
@@ -261,7 +241,7 @@ public:
             return gptr;
         }
 
-    private:
+      private:
         StreamCursor& cursor;
         size_t position;
         char *eback;
@@ -270,13 +250,16 @@ public:
     };
 
     struct Revert {
-        Revert(StreamCursor& cursor)
-            : cursor(cursor)
+        Revert(StreamCursor& _cursor)
+            : cursor(_cursor)
             , eback(cursor.buf->begptr())
             , gptr(cursor.buf->curptr())
             , egptr(cursor.buf->endptr())
             , active(true)
         { }
+
+        Revert(const Revert&) = delete;
+        Revert& operator=(const Revert&) = delete;
 
         ~Revert() {
             if (active)
@@ -297,7 +280,6 @@ public:
         char *gptr;
         char *egptr;
         bool active;
-
     };
 
     bool advance(size_t count);

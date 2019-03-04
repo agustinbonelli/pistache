@@ -1,6 +1,6 @@
 /* view.h
    Mathieu Stefani, 19 janvier 2016
-   
+
    A non-owning range of contiguous memory that is represented by
    a pointer to the beginning of the memory and the size.
 */
@@ -42,12 +42,14 @@ public:
         , size_(size)
     { }
 
-    explicit ViewBase(const T* begin, const T* end) {
+    explicit ViewBase(const T* begin, const T* end)
+        : begin_(begin)
+        , size_(0)
+    {
         if (begin > end) {
             throw std::invalid_argument("begin > end");
         }
 
-        begin_ = begin;
         size_ = std::distance(begin, end);
     }
 
@@ -242,7 +244,7 @@ namespace impl {
             return StringView(str.data(), size);
         }
     };
-};
+}
 
 template<typename Cont>
 View<typename impl::ViewBuilder<Cont>::Type> make_view(const Cont& cont)

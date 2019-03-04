@@ -8,121 +8,199 @@
 #include "gtest/gtest.h"
 #include <algorithm>
 
+#include <pistache/endpoint.h>
+#include <pistache/http.h>
 #include <pistache/router.h>
 
-using namespace Pistache;
+#include "httplib.h"
 
-bool match(const Rest::Route& route, const std::string& req) {
-    return std::get<0>(route.match(req));
+using namespace Pistache;
+using namespace Pistache::Rest;
+
+bool match(const SegmentTreeNode& routes, const std::string& req) {
+    const auto& s = SegmentTreeNode::sanitizeResource(req);
+    std::shared_ptr<Route> route;
+    std::tie(route, std::ignore, std::ignore) = routes.findRoute({s.data(), s.size()});
+    return route != nullptr;
 }
 
 bool matchParams(
-        const Rest::Route& route, const std::string& req,
-        std::initializer_list<std::pair<std::string, std::string>> list)
-{
-    bool ok;
-    std::vector<Rest::TypedParam> params;
-    std::tie(ok, params, std::ignore) = route.match(req);
+    const SegmentTreeNode& routes, const std::string& req,
+    std::initializer_list<std::pair<std::string, std::string>> list) {
 
-    if (!ok) return false;
+    const auto& s = SegmentTreeNode::sanitizeResource(req);
+    std::shared_ptr<Route> route;
+    std::vector<TypedParam> params;
+    std::string_view sv {s.data(), s.length()};
+    std::tie(route, params, std::ignore) = routes.findRoute(sv);
+
+    if (route == nullptr) return false;
 
     for (const auto& p: list) {
-        auto it = std::find_if(params.begin(), params.end(), [&](const Rest::TypedParam& param) {
-            return param.name() == p.first;
+        auto it = std::find_if(params.begin(), params.end(),
+            [&](const TypedParam& param) {
+          return param.name() == p.first;
         });
-        if (it == std::end(params)) {
-            std::cerr << "Did not find param '" << p.first << "'" << std::endl;
-            return false;
-        }
-        if (it->as<std::string>() != p.second) {
-            std::cerr << "Param '" << p.first << "' mismatched ("
-                      << p.second << " != " << it->as<std::string>() << ")" << std::endl;
-            return false;
-        }
-
+        if (it == std::end(params)) return false;
+        if (it->as<std::string>() != p.second) return false;
     }
     return true;
 }
 
 bool matchSplat(
-        const Rest::Route& route, const std::string& req,
-        std::initializer_list<std::string> list)
-{
-    bool ok;
-    std::vector<Rest::TypedParam> splats;
-    std::tie(ok, std::ignore, splats) = route.match(req);
-    
-    if (!ok) return false;
+    const SegmentTreeNode& routes, const std::string& req,
+    std::initializer_list<std::string> list) {
 
-    if (list.size() != splats.size()) {
-        std::cerr << "Size mismatch (" << list.size() << " != " << splats.size() << ")"
-                  << std::endl;
-        return false;
-    }
+    const auto& s = SegmentTreeNode::sanitizeResource(req);
+    std::shared_ptr<Route> route;
+    std::vector<TypedParam> splats;
+    std::string_view sv {s.data(), s.length()};
+    std::tie(route, std::ignore, splats) = routes.findRoute(sv);
+
+    if (route == nullptr) return false;
+
+    if (list.size() != splats.size()) return false;
 
     size_t i = 0;
-    for (const auto& s: list) {
+    for (const auto& s : list) {
         auto splat = splats[i].as<std::string>();
-        if (splat != s) {
-            std::cerr << "Splat number " << i << " did not match ("
-                      << splat << " != " << s << ")" << std::endl;
-            return false;
-        }
+        if (splat != s) return false;
         ++i;
     }
 
     return true;
 }
 
-Rest::Route
-makeRoute(std::string value) {
-    auto noop = [](const Http::Request&, Http::Response) { return Rest::Route::Result::Ok; };
-    return Rest::Route(value, Http::Method::Get, noop);
-}
-
 TEST(router_test, test_fixed_routes) {
-    auto r1 = makeRoute("/v1/hello");
-    ASSERT_TRUE(match(r1, "/v1/hello"));
-    ASSERT_FALSE(match(r1, "/v2/hello"));
-    ASSERT_FALSE(match(r1, "/v1/hell0"));
+    SegmentTreeNode routes;
+    auto s = SegmentTreeNode::sanitizeResource("/v1/hello");
+    routes.addRoute(std::string_view {s.data(), s.length()}, nullptr, nullptr);
 
-    auto r2 = makeRoute("/a/b/c");
-    ASSERT_TRUE(match(r2, "/a/b/c"));
+    ASSERT_TRUE(match(routes, "/v1/hello"));
+    ASSERT_FALSE(match(routes, "/v2/hello"));
+    ASSERT_FALSE(match(routes, "/v1/hell0"));
+
+    s = SegmentTreeNode::sanitizeResource("/a/b/c");
+    routes.addRoute(std::string_view {s.data(), s.length()}, nullptr, nullptr);
+    ASSERT_TRUE(match(routes, "/a/b/c"));
 }
 
 TEST(router_test, test_parameters) {
-    auto r1 = makeRoute("/v1/hello/:name");
-    ASSERT_TRUE(matchParams(r1, "/v1/hello/joe", {
-            { ":name", "joe" }
-    }));
+  SegmentTreeNode routes;
+  const auto& s = SegmentTreeNode::sanitizeResource("/v1/hello/:name/");
+  routes.addRoute(std::string_view {s.data(), s.length()}, nullptr, nullptr);
 
-    auto r2 = makeRoute("/greetings/:from/:to");
-    ASSERT_TRUE(matchParams(r2, "/greetings/foo/bar", {
-            { ":from", "foo" },
-            { ":to"   , "bar" }
-    }));
+  ASSERT_TRUE(matchParams(routes, "/v1/hello/joe", {
+      { ":name", "joe" }
+  }));
+
+  const auto& p = SegmentTreeNode::sanitizeResource("/greetings/:from/:to");
+  routes.addRoute(std::string_view {p.data(), p.length()}, nullptr, nullptr);
+  ASSERT_TRUE(matchParams(routes, "/greetings/foo/bar", {
+      { ":from", "foo" },
+      { ":to"   , "bar" }
+  }));
 }
 
 TEST(router_test, test_optional) {
-    auto r1 = makeRoute("/get/:key?");
-    ASSERT_TRUE(match(r1, "/get"));
-    ASSERT_TRUE(match(r1, "/get/"));
-    ASSERT_TRUE(matchParams(r1, "/get/foo", {
-            { ":key", "foo" }
-    }));
-    ASSERT_TRUE(matchParams(r1, "/get/foo/", {
-            { ":key", "foo" }
-    }));
+  SegmentTreeNode routes;
+  auto s = SegmentTreeNode::sanitizeResource("/get/:key?/bar");
+  routes.addRoute(std::string_view {s.data(), s.length()}, nullptr, nullptr);
 
-    ASSERT_FALSE(match(r1, "/get/foo/bar"));
+  ASSERT_FALSE(matchParams(routes, "/get/bar", {
+      { ":key", "whatever" }
+  }));
+  ASSERT_TRUE(matchParams(routes, "/get/foo/bar", {
+      { ":key", "foo" }
+  }));
 }
 
 TEST(router_test, test_splat) {
-    auto r1 = makeRoute("/say/*/to/*");
-    ASSERT_TRUE(match(r1, "/say/hello/to/user"));
-    ASSERT_FALSE(match(r1, "/say/hello/to"));
-    ASSERT_FALSE(match(r1, "/say/hello/to/user/please"));
+  SegmentTreeNode routes;
+  auto s = SegmentTreeNode::sanitizeResource("/say/*/to/*");
+  routes.addRoute(std::string_view {s.data(), s.length()}, nullptr, nullptr);
 
-    ASSERT_TRUE(matchSplat(r1, "/say/hello/to/user", { "hello", "user" }));
-    ASSERT_TRUE(matchSplat(r1, "/say/hello/to/user/", { "hello", "user" }));
+  ASSERT_TRUE(match(routes, "/say/hello/to/user"));
+  ASSERT_FALSE(match(routes, "/say/hello/to"));
+  ASSERT_FALSE(match(routes, "/say/hello/to/user/please"));
+
+  ASSERT_TRUE(matchSplat(routes, "/say/hello/to/user", { "hello", "user" }));
+  ASSERT_TRUE(matchSplat(routes, "/say/hello/to/user/", { "hello", "user" }));
+}
+
+TEST(router_test, test_sanitize) {
+  SegmentTreeNode routes;
+  auto s = SegmentTreeNode::sanitizeResource("//v1//hello/");
+  routes.addRoute(std::string_view {s.data(), s.length()}, nullptr, nullptr);
+
+  ASSERT_TRUE(match(routes, "/v1/hello////"));
+}
+
+TEST(router_test, test_mixed) {
+  SegmentTreeNode routes;
+  auto s = SegmentTreeNode::sanitizeResource("/hello");
+  auto p = SegmentTreeNode::sanitizeResource("/*");
+  routes.addRoute(std::string_view {s.data(), s.length()}, nullptr, nullptr);
+  routes.addRoute(std::string_view {p.data(), p.length()}, nullptr, nullptr);
+
+  ASSERT_TRUE(match(routes, "/hello"));
+  ASSERT_TRUE(match(routes, "/hi"));
+
+  ASSERT_FALSE(matchSplat(routes, "/hello", { "hello" }));
+  ASSERT_TRUE(matchSplat(routes, "/hi", { "hi" }));
+}
+
+TEST(router_test, test_notfound_exactly_once) {
+    Address addr(Ipv4::any(), 0);
+    auto endpoint = std::make_shared<Http::Endpoint>(addr);
+
+    auto opts = Http::Endpoint::options().threads(1).maxPayload(4096);
+    endpoint->init(opts);
+
+    int count_found = 0;
+    int count_not_found = 0;
+
+    Rest::Router router;
+    Routes::NotFound(router, [&count_not_found](
+            const Pistache::Rest::Request& request,
+            Pistache::Http::ResponseWriter response) {
+        count_not_found++;
+        std::string err{"Couldn't find route: \"" + request.resource() +
+                        "\"\n"};
+        response.send(Pistache::Http::Code::Not_Found, err);
+        return Pistache::Rest::Route::Result::Ok;
+    });
+    Routes::Get(router, "/moogle", [&count_found](
+            const Pistache::Rest::Request&,
+            Pistache::Http::ResponseWriter response) {
+        count_found++;
+        response.send(Pistache::Http::Code::Ok, "kupo!\n");
+        return Pistache::Rest::Route::Result::Ok;
+    });
+
+    endpoint->setHandler(router.handler());
+    endpoint->serveThreaded();
+    const auto bound_port = endpoint->getPort();
+    httplib::Client client("localhost", bound_port);
+
+    // Verify that the notFound handler is NOT called when route is found.
+    count_not_found = count_found = 0;
+    client.Get("/moogle");
+    ASSERT_EQ(count_found, 1);
+    ASSERT_EQ(count_not_found, 0);
+
+    // Verify simple solution to bug #323 (one bad url triggered 2 routes).
+    count_not_found = count_found = 0;
+    client.Get("/kefka");
+    ASSERT_EQ(count_found, 0);
+    ASSERT_EQ(count_not_found, 1);
+
+    // Anal test, 2 calls = 2 route hits.
+    count_not_found = count_found = 0;
+    client.Get("/vicks");
+    client.Get("/wedge");
+    ASSERT_EQ(count_found, 0);
+    ASSERT_EQ(count_not_found, 2);
+
+    endpoint->shutdown();
 }

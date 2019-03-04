@@ -1,6 +1,6 @@
 /* common.h
    Mathieu Stefani, 12 August 2015
-   
+
    A collection of macro / utilities / constants
 */
 
@@ -30,6 +30,7 @@
             } else { \
                 oss << strerror(errno); \
             } \
+            oss << " (" << __FILE__ << ":" << __LINE__ << ")"; \
             throw std::runtime_error(oss.str()); \
         } \
     } while (0)
@@ -41,6 +42,7 @@
             const char *str = #__VA_ARGS__; \
             std::ostringstream oss; \
             oss << str << ": " << strerror(errno); \
+            oss << " (" << __FILE__ << ":" << __LINE__ << ")"; \
             throw std::runtime_error(oss.str()); \
         } \
         return ret; \
@@ -49,12 +51,20 @@
 
 #define unreachable() __builtin_unreachable()
 
+// Until we require C++17 compiler with [[maybe_unused]]
+#define UNUSED(x) (void)(x);
+
+// Allow compile-time overload
 namespace Pistache {
 namespace Const {
 
-    static constexpr int MaxBacklog = 128;
-    static constexpr int MaxEvents = 1024;
-    static constexpr int MaxBuffer = 4096;
-    static constexpr int ChunkSize = 1024;
+    static constexpr size_t MaxBacklog = 128;
+    static constexpr size_t MaxEvents  = 1024;
+    static constexpr size_t MaxBuffer  = 4096;
+    static constexpr size_t DefaultWorkers = 1;
+
+    // Defined from CMakeLists.txt in project root
+    static constexpr size_t DefaultMaxPayload = 4096;
+    static constexpr size_t ChunkSize  = 1024;
 } // namespace Const
 } // namespace Pistache

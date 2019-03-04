@@ -1,7 +1,7 @@
 /* mime.cc
    Mathieu Stefani, 29 August 2015
-   
-   Implementaton of MIME Type parsing
+
+   Implementation of MIME Type parsing
 */
 
 #include <cstring>
@@ -82,7 +82,9 @@ MediaType::fromFile(const char* fileName)
         { "bmp", Type::Image, Subtype::Bmp },
 
         { "txt", Type::Text, Subtype::Plain },
-        { "md", Type::Text, Subtype::Plain }
+        { "md", Type::Text, Subtype::Plain },
+
+        { "bin", Type::Application, Subtype::OctetStream},
     };
 
     for (const auto& ext: KnownExtensions) {
@@ -108,7 +110,7 @@ MediaType::parseRaw(const char* str, size_t len) {
 
     raw_ = string(str, len);
 
-    Mime::Type top;
+    Mime::Type top = Type::None;
 
     // The reason we are using a do { } while (0); syntax construct here is to emulate
     // if / else-if. Since we are using items-list macros to compare the strings,

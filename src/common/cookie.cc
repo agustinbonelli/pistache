@@ -1,6 +1,6 @@
-/* 
+/*
    Mathieu Stefani, 16 janvier 2016
-   
+
    Cookie implementation
 */
 
@@ -9,6 +9,8 @@
 
 #include <pistache/cookie.h>
 #include <pistache/stream.h>
+
+using namespace std;
 
 namespace Pistache {
 namespace Http {
@@ -36,7 +38,7 @@ namespace {
     struct AttributeMatcher<Optional<std::string>> {
         static void match(StreamCursor& cursor, Cookie* obj, Optional<std::string> Cookie::*attr) {
             auto token = matchValue(cursor);
-            obj->*attr = Some(std::string(token.rawText(), token.size()));
+            obj->*attr = Some(token.text());
         }
     };
 
@@ -65,6 +67,7 @@ namespace {
     template<>
     struct AttributeMatcher<bool> {
         static void match(StreamCursor& cursor, Cookie* obj, bool Cookie::*attr) {
+            UNUSED(cursor)
             obj->*attr = true;
         }
     };
@@ -73,7 +76,7 @@ namespace {
     struct AttributeMatcher<Optional<FullDate>> {
         static void match(StreamCursor& cursor, Cookie* obj, Optional<FullDate> Cookie::*attr) {
             auto token = matchValue(cursor);
-            obj->*attr = Some(FullDate::fromRaw(token.rawText(), token.size()));
+            obj->*attr = Some(FullDate::fromString(token.text()));
         }
     };
 
@@ -94,10 +97,14 @@ namespace {
 Cookie::Cookie(std::string name, std::string value)
     : name(std::move(name))
     , value(std::move(value))
+    , path()
+    , domain()
+    , expires()
+    , maxAge()
     , secure(false)
     , httpOnly(false)
-{
-}
+    , ext()
+{ }
 
 Cookie
 Cookie::fromRaw(const char* str, size_t len)
@@ -129,7 +136,6 @@ Cookie::fromRaw(const char* str, size_t len)
 
 #define STR(str) str, sizeof(str) - 1
 
-    int c;
     do {
         skip_whitespaces(cursor);
 
@@ -201,28 +207,79 @@ Cookie::write(std::ostream& os) const {
 
 }
 
-CookieJar::CookieJar()
+std::ostream& operator<<(std::ostream& os, const Cookie& cookie)
 {
+    cookie.write(os);
+    return os;
 }
+
+CookieJar::CookieJar()
+    : cookies()
+{ }
 
 void
 CookieJar::add(const Cookie& cookie) {
-    cookies.insert(std::make_pair(cookie.name, cookie));
+
+    std::string cookieName = cookie.name;
+    std::string cookieValue = cookie.value;
+
+    Storage::iterator it = cookies.find(cookieName);
+    if(it == cookies.end()) {
+        HashMapCookies hashmapWithFirstCookie;
+        hashmapWithFirstCookie.insert(std::make_pair(cookieValue,cookie));
+        cookies.insert(std::make_pair(cookieName, hashmapWithFirstCookie));
+    } else {
+        it->second.insert(std::make_pair(cookieValue,cookie));
+    }
+
+}
+
+void 
+CookieJar::removeAllCookies() {
+	cookies.clear();
+}
+
+void
+CookieJar::addFromRaw(const char *str, size_t len) {
+    RawStreamBuf<> buf(const_cast<char *>(str), len);
+    StreamCursor cursor(&buf);
+
+    while (!cursor.eof()) {
+        StreamCursor::Token nameToken(cursor);
+
+        if (!match_until('=', cursor))
+            throw std::runtime_error("Invalid cookie, missing value");
+
+        auto name = nameToken.text();
+
+        if (!cursor.advance(1))
+            throw std::runtime_error("Invalid cookie, missing value");
+
+        StreamCursor::Token valueToken(cursor);
+
+        match_until(';', cursor);
+        auto value = valueToken.text();
+
+        Cookie cookie(std::move(name), std::move(value));
+        add(cookie);
+
+        cursor.advance(1);
+        skip_whitespaces(cursor);
+    }
 }
 
 Cookie
 CookieJar::get(const std::string& name) const {
-    auto it = cookies.find(name);
-    if (it == std::end(cookies))
-        throw std::runtime_error("Could not find requested cookie");
-
-    return it->second;
+    Storage::const_iterator it = cookies.find(name);
+    if(it != cookies.end()) {
+        return it->second.begin()->second;  // it returns begin(), first element, could be changed.
+    } 
+    throw std::runtime_error("Could not find requested cookie");
 }
 
 bool
 CookieJar::has(const std::string& name) const {
-    auto it = cookies.find(name);
-    return it != std::end(cookies);
+    return cookies.find(name) != cookies.end();
 }
 
 } // namespace Http

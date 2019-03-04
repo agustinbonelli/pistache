@@ -1,6 +1,6 @@
-/* 
+/*
    Mathieu Stefani, 13 février 2016
-   
+
    Example of an hello world server
 */
 
@@ -14,8 +14,9 @@ public:
 
     HTTP_PROTOTYPE(HelloHandler)
 
-    void onRequest(const Http::Request& request, Http::ResponseWriter response) {
-        response.send(Http::Code::Ok, "Hello World");
+    void onRequest(const Http::Request& request, Http::ResponseWriter response) override{
+        UNUSED(request);
+        response.send(Pistache::Http::Code::Ok, "Hello World\n");
     }
 };
 

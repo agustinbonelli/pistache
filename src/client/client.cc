@@ -1,16 +1,21 @@
-/* 
+/*
    Mathieu Stefani, 29 janvier 2016
-   
+
    Implementation of the Http client
 */
 
-#include <algorithm>
+#include <pistache/client.h>
+#include <pistache/http.h>
+#include <pistache/stream.h>
+#include <pistache/net.h>
 
 #include <sys/sendfile.h>
 #include <netdb.h>
 
-#include <pistache/client.h>
-#include <pistache/stream.h>
+#include <algorithm>
+#include <memory>
+#include <sstream>
+#include <string>
 
 
 namespace Pistache {
@@ -19,42 +24,31 @@ using namespace Polling;
 
 namespace Http {
 
-namespace {
-    Address httpAddr(const StringView& view) {
-        auto str = view.toString();
-        auto pos = str.find(':');
-        if (pos == std::string::npos) {
-            return Address(std::move(str), 80);
-        }
+static constexpr const char* UA = "pistache/0.1";
 
-        auto host = str.substr(0, pos);
-        auto port = std::stoi(str.substr(pos + 1));
-        return Address(std::move(host), port);
+namespace
+{
+    std::pair<StringView, StringView> splitUrl(const std::string& url)
+    {
+        RawStreamBuf<char> buf(const_cast<char *>(&url[0]), url.size());
+        StreamCursor cursor(&buf);
+
+        match_string("http://", std::strlen("http://"), cursor);
+        match_string("www", std::strlen("www"), cursor);
+        match_literal('.', cursor);
+
+        StreamCursor::Token hostToken(cursor);
+        match_until({ '?', '/' }, cursor);
+
+        StringView host(hostToken.rawText(), hostToken.size());
+        StringView page(cursor.offset(), buf.endptr());
+
+        return std::make_pair(std::move(host), std::move(page));
     }
 }
 
-static constexpr const char* UA = "pistache/0.1";
-
-std::pair<StringView, StringView>
-splitUrl(const std::string& url) {
-    RawStreamBuf<char> buf(const_cast<char *>(&url[0]), url.size());
-    StreamCursor cursor(&buf);
-
-    match_string("http://", std::strlen("http://"), cursor);
-    match_string("www", std::strlen("www"), cursor);
-    match_literal('.', cursor);
-
-    StreamCursor::Token hostToken(cursor);
-    match_until({ '?', '/' }, cursor);
-
-    StringView host(hostToken.rawText(), hostToken.size());
-    StringView page(cursor.offset(), buf.endptr());
-
-    return std::make_pair(std::move(host), std::move(page));
-}
-
 struct ExceptionPrinter {
-    void operator()(std::exception_ptr exc) {
+    void operator()(std::exception_ptr exc) const {
         try {
             std::rethrow_exception(exc);
         } catch (const std::exception& e) {
@@ -64,59 +58,48 @@ struct ExceptionPrinter {
 };
 
 namespace {
-    #define OUT(...) \
-    do { \
-        __VA_ARGS__; \
-        if (!os)  return false; \
-    } while (0)
-
-    template<typename H, typename Stream, typename... Args>
-    typename std::enable_if<Http::Header::IsHeader<H>::value, Stream&>::type
-    writeHeader(Stream& stream, Args&& ...args) {
+    template<typename H, typename... Args>
+    void writeHeader(std::stringstream& streamBuf, Args&& ...args) {
         using Http::crlf;
 
         H header(std::forward<Args>(args)...);
 
-        stream << H::Name << ": ";
-        header.write(stream);
+        streamBuf << H::Name << ": ";
+        header.write(streamBuf);
 
-        stream << crlf;
-
-        return stream;
+        streamBuf << crlf;
     }
 
-    bool writeHeaders(const Http::Header::Collection& headers, DynamicStreamBuf& buf) {
+    void writeHeaders(std::stringstream& streamBuf, const Http::Header::Collection& headers) {
         using Http::crlf;
-
-        std::ostream os(&buf);
 
         for (const auto& header: headers.list()) {
-            OUT(os << header->name() << ": ");
-            OUT(header->write(os));
-            OUT(os << crlf);
+            streamBuf << header->name() << ": ";
+            header->write(streamBuf);
+            streamBuf << crlf;
         }
-
-        return true;
     }
 
-    bool writeCookies(const Http::CookieJar& cookies, DynamicStreamBuf& buf) {
+    void writeCookies(std::stringstream& streamBuf, const Http::CookieJar& cookies) {
         using Http::crlf;
 
-        std::ostream os(&buf);
+        streamBuf << "Cookie: ";
+        bool first = true;
         for (const auto& cookie: cookies) {
-            OUT(os << "Cookie: ");
-            OUT(cookie.write(os));
-            OUT(os << crlf);
+            if (!first) {
+                streamBuf << "; ";
+            }
+            else {
+                first = false;
+            }
+            streamBuf << cookie.name << "=" << cookie.value;
         }
 
-        return true;
-
+        streamBuf << crlf;
     }
 
-    bool writeRequest(const Http::Request& request, DynamicStreamBuf &buf) {
+    void writeRequest(std::stringstream& streamBuf, const Http::Request& request) {
         using Http::crlf;
-
-        std::ostream os(&buf);
 
         auto res = request.resource();
         auto s = splitUrl(res);
@@ -127,32 +110,26 @@ namespace {
 
         auto pathStr = path.toString();
 
-        OUT(os << request.method() << " ");
+        streamBuf << request.method() << " ";
         if (pathStr[0] != '/')
-            OUT(os << '/');
-        OUT(os << pathStr);
-        OUT(os << " HTTP/1.1" << crlf);
+            streamBuf << '/';
+        streamBuf << pathStr;
+        streamBuf << " HTTP/1.1" << crlf;
 
-        if (!writeCookies(request.cookies(), buf)) return false;
-        if (!writeHeaders(request.headers(), buf)) return false;
+        writeCookies(streamBuf, request.cookies());
+        writeHeaders(streamBuf, request.headers());
 
-        if (!writeHeader<Http::Header::UserAgent>(os, UA)) return false;
-        if (!writeHeader<Http::Header::Host>(os, host.toString())) return false;
+        writeHeader<Http::Header::UserAgent>(streamBuf, UA);
+        writeHeader<Http::Header::Host>(streamBuf, host.toString());
         if (!body.empty()) {
-            if (!writeHeader<Http::Header::ContentLength>(os, body.size())) return false;
+            writeHeader<Http::Header::ContentLength>(streamBuf, body.size());
         }
-        OUT(os << crlf);
+        streamBuf << crlf;
 
         if (!body.empty()) {
-            OUT(os << body);
+            streamBuf << body;
         }
-
-        return true;
-
-
     }
-
-#undef OUT
 }
 
 void
@@ -168,9 +145,16 @@ Transport::onReady(const Aio::FdSet& fds) {
         else if (entry.isReadable()) {
             auto tag = entry.getTag();
             auto fd = tag.value();
-            auto reqIt = connections.find(fd);
-            if (reqIt != std::end(connections))
-                handleIncoming(reqIt->second.connection);
+            auto connIt = connections.find(fd);
+            if (connIt != std::end(connections)) {
+                auto connection = connIt->second.connection.lock();
+                if (connection) {
+                    handleIncoming(connection);
+                }
+                else {
+                    throw std::runtime_error("Connection error");
+                }
+            }
             else {
                 auto timerIt = timeouts.find(fd);
                 if (timerIt != std::end(timeouts))
@@ -191,7 +175,12 @@ Transport::onReady(const Aio::FdSet& fds) {
                 else {
                     conn.resolve();
                     // We are connected, we can start reading data now
-                    reactor()->modifyFd(key(), conn.connection->fd, NotifyOn::Read);
+                    auto connection = connIt->second.connection.lock();
+                    if (connection) {
+                        reactor()->modifyFd(key(), connection->fd(), NotifyOn::Read);
+                    } else {
+                        throw std::runtime_error("Connection error");
+                    }
                 }
             } else {
                 throw std::runtime_error("Unknown fd");
@@ -207,30 +196,26 @@ Transport::registerPoller(Polling::Epoll& poller) {
 }
 
 Async::Promise<void>
-Transport::asyncConnect(const std::shared_ptr<Connection>& connection, const struct sockaddr* address, socklen_t addr_len)
+Transport::asyncConnect(std::shared_ptr<Connection> connection, const struct sockaddr* address, socklen_t addr_len)
 {
     return Async::Promise<void>([=](Async::Resolver& resolve, Async::Rejection& reject) {
         ConnectionEntry entry(std::move(resolve), std::move(reject), connection, address, addr_len);
-        auto *e = connectionsQueue.allocEntry(std::move(entry));
-        connectionsQueue.push(e);
+        connectionsQueue.push(std::move(entry));
     });
 }
 
 Async::Promise<ssize_t>
 Transport::asyncSendRequest(
-        const std::shared_ptr<Connection>& connection,
+        std::shared_ptr<Connection> connection,
         std::shared_ptr<TimerPool::Entry> timer,
-        const Buffer& buffer) {
+        std::string buffer) {
 
     return Async::Promise<ssize_t>([&](Async::Resolver& resolve, Async::Rejection& reject) {
         auto ctx = context();
+        RequestEntry req(std::move(resolve), std::move(reject), connection, std::move(timer), std::move(buffer));
         if (std::this_thread::get_id() != ctx.thread()) {
-            RequestEntry req(std::move(resolve), std::move(reject), connection, std::move(timer), buffer.detach());
-            auto *e = requestsQueue.allocEntry(std::move(req));
-            requestsQueue.push(e);
+            requestsQueue.push(std::move(req));
         } else {
-            RequestEntry req(std::move(resolve), std::move(reject), connection, std::move(timer), buffer);
-
             asyncSendRequestImpl(req);
         }
     });
@@ -241,21 +226,18 @@ void
 Transport::asyncSendRequestImpl(
         const RequestEntry& req, WriteStatus status)
 {
-    auto buffer = req.buffer;
+    const auto& buffer = req.buffer;
+    auto conn = req.connection.lock();
+    if (!conn)
+        throw std::runtime_error("Send request error");
 
-    auto cleanUp = [&]() {
-        if (buffer.isOwned) delete[] buffer.data;
-    };
-
-    auto conn = req.connection;
-
-    auto fd = conn->fd;
+    auto fd = conn->fd();
 
     ssize_t totalWritten = 0;
     for (;;) {
         ssize_t bytesWritten = 0;
-        auto len = buffer.len - totalWritten;
-        auto ptr = buffer.data + totalWritten;
+        ssize_t len = buffer.size() - totalWritten;
+        auto ptr = buffer.data() + totalWritten;
         bytesWritten = ::send(fd, ptr, len, 0);
         if (bytesWritten < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -265,7 +247,6 @@ Transport::asyncSendRequestImpl(
                 reactor()->modifyFd(key(), fd, NotifyOn::Write, Polling::Mode::Edge);
             }
             else {
-                cleanUp();
                 req.reject(Error::system("Could not send request"));
             }
             break;
@@ -273,7 +254,6 @@ Transport::asyncSendRequestImpl(
         else {
             totalWritten += bytesWritten;
             if (totalWritten == len) {
-                cleanUp();
                 if (req.timer) {
                     timeouts.insert(
                           std::make_pair(req.timer->fd, conn));
@@ -290,48 +270,45 @@ void
 Transport::handleRequestsQueue() {
     // Let's drain the queue
     for (;;) {
-        auto entry = requestsQueue.popSafe();
-        if (!entry) break;
+        auto req = requestsQueue.popSafe();
+        if (!req) break;
 
-        auto &req = entry->data();
-        asyncSendRequestImpl(req);
+        asyncSendRequestImpl(*req);
     }
 }
 
 void
 Transport::handleConnectionQueue() {
     for (;;) {
-        auto entry = connectionsQueue.popSafe();
-        if (!entry) break;
+        auto data = connectionsQueue.popSafe();
+        if (!data) break;
 
-
-        auto &data = entry->data();
-        const auto& conn = data.connection;
-        int res = ::connect(conn->fd, data.addr, data.addr_len);
+        auto conn = data->connection.lock();
+        if (!conn) {
+            throw std::runtime_error("Connection error");
+        }
+        int res = ::connect(conn->fd(), data->getAddr(), data->addr_len);
         if (res == -1) {
             if (errno == EINPROGRESS) {
-                reactor()->registerFdOneShot(key(), conn->fd, NotifyOn::Write | NotifyOn::Hangup | NotifyOn::Shutdown);
+                reactor()->registerFdOneShot(key(), conn->fd(), NotifyOn::Write | NotifyOn::Hangup | NotifyOn::Shutdown);
             }
             else {
-                data.reject(Error::system("Failed to connect"));
+                data->reject(Error::system("Failed to connect"));
                 continue;
             }
         }
-        connections.insert(std::make_pair(conn->fd, std::move(data)));
+        connections.insert(std::make_pair(conn->fd(), std::move(*data)));
     }
 }
 
 void
-Transport::handleIncoming(const std::shared_ptr<Connection>& connection) {
-    char buffer[Const::MaxBuffer];
-    memset(buffer, 0, sizeof buffer);
+Transport::handleIncoming(std::shared_ptr<Connection> connection) {
+    char buffer[Const::MaxBuffer] = {0};
 
     ssize_t totalBytes = 0;
+
     for (;;) {
-
-        ssize_t bytes;
-
-        bytes = recv(connection->fd, buffer + totalBytes, Const::MaxBuffer - totalBytes, 0);
+        ssize_t bytes = recv(connection->fd(), buffer + totalBytes, Const::MaxBuffer - totalBytes, 0);
         if (bytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (totalBytes > 0) {
@@ -348,15 +325,15 @@ Transport::handleIncoming(const std::shared_ptr<Connection>& connection) {
             } else {
                 connection->handleError("Remote closed connection");
             }
-            connections.erase(connection->fd);
+            connections.erase(connection->fd());
             connection->close();
             break;
         }
 
         else {
             totalBytes += bytes;
-            if (totalBytes >= Const::MaxBuffer) {
-                std::cerr << "Too long packet" << std::endl;
+            if (static_cast<size_t>(totalBytes) > Const::MaxBuffer) {
+                std::cerr << "Client: Too long packet" << std::endl;
                 break;
             }
         }
@@ -373,44 +350,48 @@ Transport::handleTimeout(const std::shared_ptr<Connection>& connection) {
     connection->handleTimeout();
 }
 
+Connection::Connection()
+    : fd_(-1)
+    , requestEntry(nullptr)
+{
+    state_.store(static_cast<uint32_t>(State::Idle));
+    connectionState_.store(NotConnected);
+}
+
 void
-Connection::connect(Address addr)
+Connection::connect(const Address& addr)
 {
     struct addrinfo hints;
-    struct addrinfo *addrs;
     memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
+    hints.ai_family = addr.family();
     hints.ai_socktype = SOCK_STREAM; /* Stream socket */
     hints.ai_flags = 0;
-    hints.ai_protocol = 0;  
+    hints.ai_protocol = 0;
 
-    auto host = addr.host();
+    const auto& host = addr.host();
+    const auto& port = addr.port().toString();
 
-    /* We rely on the fact that a string literal is an lvalue const char[N] */
-    static constexpr size_t MaxPortLen = sizeof("65535");
-
-    char port[MaxPortLen];
-    std::fill(port, port + MaxPortLen, 0);
-    std::snprintf(port, MaxPortLen, "%d", static_cast<uint16_t>(addr.port()));
-
-    TRY(::getaddrinfo(host.c_str(), port, &hints, &addrs));
-
+    AddrInfo addressInfo;
+    
+    TRY(addressInfo.invoke(host.c_str(), port.c_str(), &hints));
+    const addrinfo *addrs = addressInfo.get_info_ptr();
+    
     int sfd = -1;
 
-    for (struct addrinfo *addr = addrs; addr; addr = addr->ai_next) {
+    for (const addrinfo *addr = addrs; addr; addr = addr->ai_next) {
         sfd = ::socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (sfd < 0) continue;
 
         make_non_blocking(sfd);
 
-        connectionState_ = Connecting;
-        fd = sfd;
+        connectionState_.store(Connecting);
+        fd_ = sfd;
 
         transport_->asyncConnect(shared_from_this(), addr->ai_addr, addr->ai_addrlen)
-            .then([=]() { 
+            .then([=]() {
                 socklen_t len = sizeof(saddr);
                 getsockname(sfd, (struct sockaddr *)&saddr, &len);
-                connectionState_ = Connected;
+                connectionState_.store(Connected);
                 processRequestQueue();
             }, ExceptionPrinter());
         break;
@@ -424,7 +405,7 @@ Connection::connect(Address addr)
 std::string
 Connection::dump() const {
     std::ostringstream oss;
-    oss << "Connection(fd = " << fd << ", src_port = ";
+    oss << "Connection(fd = " << fd_ << ", src_port = ";
     oss << ntohs(saddr.sin_port) << ")";
     return oss.str();
 }
@@ -436,13 +417,13 @@ Connection::isIdle() const {
 
 bool
 Connection::isConnected() const {
-    return connectionState_ == Connected;
+    return connectionState_.load() == Connected;
 }
 
 void
 Connection::close() {
-    connectionState_ = NotConnected;
-    ::close(fd);
+    connectionState_.store(NotConnected);
+    ::close(fd_);
 }
 
 void
@@ -458,47 +439,72 @@ Connection::hasTransport() const {
     return transport_ != nullptr;
 }
 
+Fd Connection::fd() const
+{
+    assert(fd_ != -1);
+    return fd_;
+}
+
 void
-Connection::handleResponsePacket(const char* buffer, size_t bytes) {
+Connection::handleResponsePacket(const char* buffer, size_t totalBytes) {
 
-    parser_.feed(buffer, bytes);
-    if (parser_.parse() == Private::State::Done) {
-        auto req = std::move(inflightRequests.front());
-        inflightRequests.pop_back();
+    parser.feed(buffer, totalBytes);
+    if (parser.parse() == Private::State::Done) {
+        if (requestEntry) {
+            if (requestEntry->timer) {
+                requestEntry->timer->disarm();
+                timerPool_.releaseTimer(requestEntry->timer);
+            }
 
-        if (req.timer) {
-            req.timer->disarm();
-            timerPool_.releaseTimer(req.timer);
+            requestEntry->resolve(std::move(parser.response));
+            parser.reset();
+
+            auto onDone = requestEntry->onDone;
+
+            requestEntry.reset(nullptr);
+
+            if (onDone)
+                onDone();
         }
-
-        req.resolve(std::move(parser_.response));
-        req.onDone();
-        parser_.reset();
     }
 }
 
 void
 Connection::handleError(const char* error) {
-    auto req = std::move(inflightRequests.front());
-    if (req.timer) {
-        req.timer->disarm();
-        timerPool_.releaseTimer(req.timer);
-    }
+    if (requestEntry) {
+        if (requestEntry->timer) {
+            requestEntry->timer->disarm();
+            timerPool_.releaseTimer(requestEntry->timer);
+        }
 
-    req.reject(Error(error));
-    req.onDone();
+        auto onDone = requestEntry->onDone;
+
+        requestEntry->reject(Error(error));
+
+        requestEntry.reset(nullptr);
+
+        if (onDone)
+            onDone();
+    }
 }
 
 void
 Connection::handleTimeout() {
-    auto req = std::move(inflightRequests.front());
-    inflightRequests.pop_back();
+    if (requestEntry) {
+        timerPool_.releaseTimer(requestEntry->timer);
 
-    timerPool_.releaseTimer(req.timer);
-    req.onDone();
-    /* @API: create a TimeoutException */
-    req.reject(std::runtime_error("Timeout"));
+        auto onDone = requestEntry->onDone;
+
+        /* @API: create a TimeoutException */
+        requestEntry->reject(std::runtime_error("Timeout"));
+
+        requestEntry.reset(nullptr);
+
+        if (onDone)
+            onDone();
+    }
 }
+
 
 Async::Promise<Response>
 Connection::perform(
@@ -506,55 +512,24 @@ Connection::perform(
         std::chrono::milliseconds timeout,
         Connection::OnDone onDone) {
     return Async::Promise<Response>([=](Async::Resolver& resolve, Async::Rejection& reject) {
-        if (!isConnected()) {
-            auto* entry = requestsQueue.allocEntry(
-                RequestData(
-                    std::move(resolve),
-                    std::move(reject),
-                    request,
-                    timeout,
-                    std::move(onDone)));
-            requestsQueue.push(entry);
-        } else {
-            performImpl(request, timeout, std::move(resolve), std::move(reject), std::move(onDone));
-        }
+        performImpl(request, timeout, std::move(resolve), std::move(reject), std::move(onDone));
     });
 }
 
-/**
- * This class is used to emulate the generalized lambda capture feature from C++14
- * whereby a given object can be moved inside a lambda, directly from the capture-list
- *
- * So instead, it will use the exact same semantic than auto_ptr (don't beat me for that),
- * meaning that it will move the value on copy
- */
-template<typename T>
-struct MoveOnCopy {
-    MoveOnCopy(T val)
-        : val(std::move(val))
-    { }
-
-    MoveOnCopy(MoveOnCopy& other)
-        : val(std::move(other.val))
-    { }
-
-    MoveOnCopy& operator=(MoveOnCopy& other) {
-        val = std::move(other.val);
-    }
-
-    MoveOnCopy(MoveOnCopy&& other) = default;
-    MoveOnCopy& operator=(MoveOnCopy&& other) = default;
-
-    operator T&&() {
-        return std::move(val);
-    }
-
-    T val;
-};
-
-template<typename T>
-MoveOnCopy<T> make_copy_mover(T arg) {
-    return MoveOnCopy<T>(std::move(arg));
+Async::Promise<Response>
+Connection::asyncPerform(
+        const Http::Request& request,
+        std::chrono::milliseconds timeout,
+        Connection::OnDone onDone) {
+    return Async::Promise<Response>([=](Async::Resolver& resolve, Async::Rejection& reject) {
+        requestsQueue.push(
+            RequestData(
+                std::move(resolve),
+                std::move(reject),
+                request,
+                timeout,
+                std::move(onDone)));
+    });
 }
 
 void
@@ -565,12 +540,12 @@ Connection::performImpl(
         Async::Rejection reject,
         Connection::OnDone onDone) {
 
-    DynamicStreamBuf buf(128);
-
-    if (!writeRequest(request, buf))
+    std::stringstream streamBuf;
+    writeRequest(streamBuf, request);
+    if (!streamBuf)
         reject(std::runtime_error("Could not write request"));
+    std::string buffer = streamBuf.str();
 
-    auto buffer = buf.buffer();
     std::shared_ptr<TimerPool::Entry> timer(nullptr);
     if (timeout.count() > 0) {
         timer = timerPool_.pickTimer();
@@ -578,30 +553,22 @@ Connection::performImpl(
     }
 
     auto rejectClone = reject.clone();
-    auto rejectCloneMover = make_copy_mover(std::move(rejectClone));
 
-    // Move the resolver and rejecter inside the lambda
-    auto resolveMover = make_copy_mover(std::move(resolve));
-    auto rejectMover = make_copy_mover(std::move(reject));
-
-
-    transport_->asyncSendRequest(shared_from_this(), timer, buffer).then(
-        [=](ssize_t bytes) mutable {
-            inflightRequests.push_back(RequestEntry(std::move(resolveMover), std::move(rejectMover), std::move(timer), std::move(onDone)));
-        },
-        [=](std::exception_ptr e) { rejectCloneMover.val(e); });
+    requestEntry.reset(new RequestEntry(std::move(resolve), std::move(reject), timer, std::move(onDone)));
+    transport_->asyncSendRequest(shared_from_this(), timer, std::move(buffer)).then(
+        [](size_t /*bytes*/) {},
+        [&](std::exception_ptr e) { rejectClone(e); });
 }
 
 void
 Connection::processRequestQueue() {
     for (;;) {
-        auto entry = requestsQueue.popSafe();
-        if (!entry) break;
+        auto req = requestsQueue.popSafe();
+        if (!req) break;
 
-        auto &req = entry->data();
         performImpl(
-                req.request,
-                req.timeout, std::move(req.resolve), std::move(req.reject), std::move(req.onDone));
+                req->request,
+                req->timeout, std::move(req->resolve), std::move(req->reject), std::move(req->onDone));
     }
 
 }
@@ -682,11 +649,13 @@ ConnectionPool::idleConnections(const std::string& domain) const {
 
 size_t
 ConnectionPool::availableConnections(const std::string& domain) const {
+    UNUSED(domain)
     return 0;
 }
 
 void
 ConnectionPool::closeIdleConnections(const std::string& domain) {
+    UNUSED(domain)
 }
 
 RequestBuilder&
@@ -697,14 +666,14 @@ RequestBuilder::method(Method method)
 }
 
 RequestBuilder&
-RequestBuilder::resource(std::string val) {
-    request_.resource_ = std::move(val);
+RequestBuilder::resource(const std::string& val) {
+    request_.resource_ = val;
     return *this;
 }
 
 RequestBuilder&
-RequestBuilder::params(const Uri::Query& params) {
-    request_.query_ = params;
+RequestBuilder::params(const Uri::Query& query) {
+    request_.query_ = query;
     return *this;
 }
 
@@ -721,14 +690,26 @@ RequestBuilder::cookie(const Cookie& cookie) {
 }
 
 RequestBuilder&
-RequestBuilder::body(std::string val) {
+RequestBuilder::body(const std::string& val) {
+    request_.body_ = val;
+    return *this;
+}
+
+RequestBuilder&
+RequestBuilder::body(std::string&& val) {
     request_.body_ = std::move(val);
+    return *this;
+}
+
+RequestBuilder&
+RequestBuilder::timeout(std::chrono::milliseconds val) {
+    timeout_ = val;
     return *this;
 }
 
 Async::Promise<Response>
 RequestBuilder::send() {
-    return client_->doRequest(std::move(request_), timeout_);
+    return client_->doRequest(request_, timeout_);
 }
 
 Client::Options&
@@ -751,20 +732,16 @@ Client::Options::maxConnectionsPerHost(int val) {
 
 Client::Client()
     : reactor_(Aio::Reactor::create())
+    , pool()
+    , transportKey()
     , ioIndex(0)
-{
-}
+    , queuesLock()
+    , requestsQueues()
+    , stopProcessPequestsQueues(false)
+{ }
 
 Client::~Client() {
-    for (auto& queues: requestsQueues) {
-        auto& q = queues.second;
-        for (;;) {
-            Connection::RequestData* d;
-            if (!q.dequeue(d)) break;
-
-            delete d;
-        }
-    }
+    assert(stopProcessPequestsQueues == true && "You must explicitly call shutdown method of Client object");
 }
 
 Client::Options
@@ -775,53 +752,54 @@ Client::options() {
 void
 Client::init(const Client::Options& options) {
     pool.init(options.maxConnectionsPerHost_);
-    transport_.reset(new Transport);
     reactor_->init(Aio::AsyncContext(options.threads_));
-    transportKey = reactor_->addHandler(transport_);
+    transportKey = reactor_->addHandler(std::make_shared<Transport>());
     reactor_->run();
 }
 
 void
 Client::shutdown() {
     reactor_->shutdown();
+    Guard guard(queuesLock);
+    stopProcessPequestsQueues = true;
 }
 
 RequestBuilder
-Client::get(std::string resource)
+Client::get(const std::string& resource)
 {
-    return prepareRequest(std::move(resource), Http::Method::Get);
+    return prepareRequest(resource, Http::Method::Get);
 }
 
 RequestBuilder
-Client::post(std::string resource)
+Client::post(const std::string& resource)
 {
-    return prepareRequest(std::move(resource), Http::Method::Post);
+    return prepareRequest(resource, Http::Method::Post);
 }
 
 RequestBuilder
-Client::put(std::string resource)
+Client::put(const std::string& resource)
 {
-    return prepareRequest(std::move(resource), Http::Method::Put);
+    return prepareRequest(resource, Http::Method::Put);
 }
 
 RequestBuilder
-Client::patch(std::string resource)
+Client::patch(const std::string& resource)
 {
-    return prepareRequest(std::move(resource), Http::Method::Patch);
+    return prepareRequest(resource, Http::Method::Patch);
 }
 
 RequestBuilder
-Client::del(std::string resource)
+Client::del(const std::string& resource)
 {
-    return prepareRequest(std::move(resource), Http::Method::Delete);
+    return prepareRequest(resource, Http::Method::Delete);
 }
 
 RequestBuilder
-Client::prepareRequest(std::string resource, Http::Method method)
+Client::prepareRequest(const std::string& resource, Http::Method method)
 {
     RequestBuilder builder(this);
     builder
-        .resource(std::move(resource))
+        .resource(resource)
         .method(method);
 
     return builder;
@@ -832,6 +810,7 @@ Client::doRequest(
         Http::Request request,
         std::chrono::milliseconds timeout)
 {
+    //request.headers_.add<Header::Connection>(ConnectionControl::KeepAlive);
     request.headers_.remove<Header::UserAgent>();
     auto resource = request.resource();
 
@@ -839,17 +818,14 @@ Client::doRequest(
     auto conn = pool.pickConnection(s.first);
 
     if (conn == nullptr) {
-        return Async::Promise<Response>([=](Async::Resolver& resolve, Async::Rejection& reject) {
+        // TODO: C++14 - use capture move for s
+        return Async::Promise<Response>([this, s, request, timeout](Async::Resolver& resolve, Async::Rejection& reject) {
             Guard guard(queuesLock);
 
-            std::unique_ptr<Connection::RequestData> data(
-                    new Connection::RequestData(std::move(resolve), std::move(reject), request, timeout, nullptr));
-
+            auto data = std::make_shared<Connection::RequestData>(std::move(resolve), std::move(reject), request, timeout, nullptr);
             auto& queue = requestsQueues[s.first];
-            if (!queue.enqueue(data.get()))
+            if (!queue.enqueue(data))
                 data->reject(std::runtime_error("Queue is full"));
-            else
-                data.release();
         });
     }
     else {
@@ -864,10 +840,15 @@ Client::doRequest(
         }
 
         if (!conn->isConnected()) {
-            conn->connect(httpAddr(s.first));
+            auto res = conn->asyncPerform(request, timeout, [this, conn]() {
+                pool.releaseConnection(conn);
+                processRequestQueue();
+            });
+            conn->connect(helpers::httpAddr(s.first));
+            return res;
         }
 
-        return conn->perform(request, timeout, [=]() {
+        return conn->perform(request, timeout, [this, conn]() {
             pool.releaseConnection(conn);
             processRequestQueue();
         });
@@ -878,17 +859,18 @@ void
 Client::processRequestQueue() {
     Guard guard(queuesLock);
 
-    for (auto& queues: requestsQueues) {
-        const auto& domain = queues.first;
-        auto& queue = queues.second;
+    if (stopProcessPequestsQueues)
+        return;
 
+    for (auto& queues: requestsQueues) {
         for (;;) {
+            const auto& domain = queues.first;
             auto conn = pool.pickConnection(domain);
             if (!conn)
                 break;
 
             auto& queue = queues.second;
-            Connection::RequestData *data;
+            std::shared_ptr<Connection::RequestData> data;
             if (!queue.dequeue(data)) {
                 pool.releaseConnection(conn);
                 break;
@@ -898,12 +880,10 @@ Client::processRequestQueue() {
                     data->request,
                     data->timeout,
                     std::move(data->resolve), std::move(data->reject),
-                    [=]() {
+                    [this, conn]() {
                         pool.releaseConnection(conn);
                         processRequestQueue();
                     });
-
-            delete data;
         }
     }
 }

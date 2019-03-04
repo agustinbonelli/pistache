@@ -1,36 +1,82 @@
 /* stream.cc
    Mathieu Stefani, 05 September 2015
-   
+
 */
+
+#include <pistache/stream.h>
 
 #include <iostream>
 #include <algorithm>
+#include <string>
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 
-#include <pistache/stream.h>
 
 namespace Pistache {
 
-FileBuffer::FileBuffer(const char* fileName)
-    : fileName_(fileName)
+RawBuffer::RawBuffer()
+    : data_()
+    , length_(0)
+    , isDetached_(false)
+{ }
+
+RawBuffer::RawBuffer(std::string data, size_t length, bool isDetached)
+    : data_(std::move(data))
+    , length_(length)
+    , isDetached_(isDetached)
+{ }
+
+RawBuffer::RawBuffer(const char* data, size_t length, bool isDetached)
+    : data_()
+    , length_(length)
+    , isDetached_(isDetached)
 {
-    init(fileName);
+    data_.resize(length_ + 1);
+    data_.assign(data, length_ + 1);
+}
+
+RawBuffer RawBuffer::detach(size_t fromIndex)
+{
+    if (data_.empty())
+        return RawBuffer();
+
+    if (length_ < fromIndex)
+        throw std::range_error("Trying to detach buffer from an index bigger than lengthght.");
+
+    auto newDatalength = length_ - fromIndex;
+    std::string newData = data_.substr(fromIndex, newDatalength);
+
+    return RawBuffer(std::move(newData), newDatalength, true);
+}
+
+const std::string& RawBuffer::data() const
+{
+    return data_;
+}
+
+size_t RawBuffer::size() const
+{
+    return length_;
+}
+
+bool RawBuffer::isDetached() const
+{
+    return isDetached_;
 }
 
 FileBuffer::FileBuffer(const std::string& fileName)
     : fileName_(fileName)
+    , fd_(-1)
+    , size_(0)
 {
-    init(fileName.c_str());
-}
+    if (fileName.empty()) {
+        throw std::runtime_error("Empty fileName");
+    }
 
-void
-FileBuffer::init(const char* fileName)
-{
-    int fd = open(fileName, O_RDONLY);
+    int fd = open(fileName.c_str(), O_RDONLY);
     if (fd == -1) {
         throw std::runtime_error("Could not open file");
     }
@@ -43,6 +89,16 @@ FileBuffer::init(const char* fileName)
 
     fd_ = fd;
     size_ = sb.st_size;
+}
+
+Fd FileBuffer::fd() const
+{
+    return fd_;
+}
+
+size_t FileBuffer::size() const
+{
+    return size_;
 }
 
 DynamicStreamBuf::int_type
@@ -71,7 +127,7 @@ DynamicStreamBuf::reserve(size_t size)
 
 bool
 StreamCursor::advance(size_t count) {
-    if (count > buf->in_avail())
+    if (static_cast<ssize_t>(count) > buf->in_avail())
         return false;
 
     for (size_t i = 0; i < count; ++i) {

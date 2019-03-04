@@ -4,17 +4,16 @@
    Implementation of common HTTP headers described by the RFC
 */
 
-#include <stdexcept>
-#include <iterator>
-#include <cstring>
-#include <iostream>
-
 #include <pistache/http_header.h>
 #include <pistache/common.h>
 #include <pistache/http.h>
 #include <pistache/stream.h>
 
-using namespace std;
+#include <stdexcept>
+#include <iterator>
+#include <limits>
+#include <cstring>
+#include <iostream>
 
 namespace Pistache {
 namespace Http {
@@ -51,6 +50,8 @@ Header::parseRaw(const char *str, size_t len) {
 
 void
 Allow::parseRaw(const char* str, size_t len) {
+    UNUSED(str)
+    UNUSED(len)
 }
 
 void
@@ -122,11 +123,6 @@ CacheControl::parseRaw(const char* str, size_t len) {
     RawStreamBuf<> buf(const_cast<char *>(str), len);
     StreamCursor cursor(&buf);
 
-    const char *begin = str;
-    auto memsize = [&](size_t s) {
-        return std::min(s, cursor.remaining());
-    };
-
     do {
 
         bool found = false;
@@ -143,7 +139,6 @@ CacheControl::parseRaw(const char* str, size_t len) {
         if (!found) {
             for (const auto& d: TimedDirectives) {
                 if (match_raw(d.str, d.size, cursor)) {
-                    int c;
                     if (!cursor.advance(1)) {
                         throw std::runtime_error("Invalid caching directive, missing delta-seconds");
                     }
@@ -182,7 +177,7 @@ void
 CacheControl::write(std::ostream& os) const {
     using Http::CacheDirective;
 
-    auto directiveString = [](CacheDirective directive) -> const char* const {
+    auto directiveString = [](CacheDirective directive) -> const char* {
         switch (directive.directive()) {
             case CacheDirective::NoCache:
                 return "no-cache";
@@ -210,7 +205,10 @@ CacheControl::write(std::ostream& os) const {
                 return "s-maxage";
             case CacheDirective::Ext:
                 return "";
+            default:
+                return "";
         }
+        return "";
     };
 
     auto hasDelta = [](CacheDirective directive) {
@@ -282,6 +280,9 @@ Connection::write(std::ostream& os) const {
     case ConnectionControl::KeepAlive:
         os << "Keep-Alive";
         break;
+    case ConnectionControl::Ext:
+        os << "Ext";
+        break;
     }
 }
 
@@ -304,12 +305,13 @@ ContentLength::write(std::ostream& os) const {
 }
 
 void
-Date::parseRaw(const char* str, size_t len) {
-    fullDate_ = FullDate::fromRaw(str, len);
+Date::parse(const std::string &str) {
+    fullDate_ = FullDate::fromString(str);
 }
 
 void
 Date::write(std::ostream& os) const {
+	fullDate_.write(os);
 }
 
 void
@@ -328,22 +330,25 @@ Expect::write(std::ostream& os) const {
     }
 }
 
-Host::Host(const std::string& data) {
+Host::Host(const std::string& data)
+    : host_()
+    , port_(0)
+{
     parse(data);
 }
 
-void
-Host::parse(const std::string& data) {
-    auto pos = data.find(':');
-    if (pos != std::string::npos) {
-        std::string h = data.substr(0, pos);
-        int16_t p = std::stoi(data.substr(pos + 1));
-
-        host_ = h;
-        port_ = p;
-    } else {
-        host_ = data;
-        port_ = 80;
+void Host::parse(const std::string& data)
+{
+    AddressParser parser(data);
+    host_ = parser.rawHost();
+    const std::string& port = parser.rawPort();
+    if (port.empty())
+    {
+        port_ = HTTP_STANDARD_PORT;
+    }
+    else
+    {
+        port_ = Port(port);
     }
 }
 
@@ -416,6 +421,7 @@ Accept::parseRaw(const char *str, size_t len) {
 
 void
 Accept::write(std::ostream& os) const {
+    UNUSED(os)
 }
 
 void
@@ -429,22 +435,50 @@ AccessControlAllowOrigin::write(std::ostream& os) const {
 }
 
 void
+AccessControlAllowHeaders::parse(const std::string& data) {
+  val_ = data;
+}
+
+void
+AccessControlAllowHeaders::write(std::ostream& os) const {
+  os << val_;
+}
+
+void
+AccessControlExposeHeaders::parse(const std::string& data) {
+  val_ = data;
+}
+
+void
+AccessControlExposeHeaders::write(std::ostream& os) const {
+  os << val_;
+}
+
+void
+AccessControlAllowMethods::parse(const std::string& data) {
+  val_ = data;
+}
+
+void
+AccessControlAllowMethods::write(std::ostream& os) const {
+  os << val_;
+}
+
+void
 EncodingHeader::parseRaw(const char* str, size_t len) {
-    // TODO: case-insensitive
-    //
-    if (!strncmp(str, "gzip", len)) {
+    if (!strncasecmp(str, "gzip", len)) {
         encoding_ = Encoding::Gzip;
     }
-    else if (!strncmp(str, "deflate", len)) {
+    else if (!strncasecmp(str, "deflate", len)) {
         encoding_ = Encoding::Deflate;
     }
-    else if (!strncmp(str, "compress", len)) {
+    else if (!strncasecmp(str, "compress", len)) {
         encoding_ = Encoding::Compress;
     }
-    else if (!strncmp(str, "identity", len)) {
+    else if (!strncasecmp(str, "identity", len)) {
         encoding_ = Encoding::Identity;
     }
-    else if (!strncmp(str, "chunked", len)) {
+    else if (!strncasecmp(str, "chunked", len)) {
         encoding_ = Encoding::Chunked;
     }
     else {
@@ -462,11 +496,13 @@ Server::Server(const std::vector<std::string>& tokens)
 { }
 
 Server::Server(const std::string& token)
+    : tokens_()
 {
     tokens_.push_back(token);
 }
 
 Server::Server(const char* token)
+   : tokens_()
 {
     tokens_.emplace_back(token);
 }
@@ -474,6 +510,7 @@ Server::Server(const char* token)
 void
 Server::parse(const std::string& data)
 {
+    UNUSED(data)
 }
 
 void

@@ -1,19 +1,8 @@
 /* http.cc
    Mathieu Stefani, 13 August 2015
-   
+
    Http layer implementation
 */
-
-#include <cstring>
-#include <iostream>
-#include <stdexcept>
-#include <ctime>
-#include <iomanip>
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 #include <pistache/common.h>
 #include <pistache/http.h>
@@ -21,17 +10,30 @@
 #include <pistache/peer.h>
 #include <pistache/transport.h>
 
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <ctime>
+#include <iomanip>
+#include <unordered_map>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+
 using namespace std;
 
 namespace Pistache {
 namespace Http {
 
-template<typename H, typename Stream, typename... Args>
-typename std::enable_if<Header::IsHeader<H>::value, Stream&>::type
-writeHeader(Stream& stream, Args&& ...args) {
-    H header(std::forward<Args>(args)...);
-
-    stream << H::Name << ": ";
+    template<typename H, typename Stream, typename... Args>
+    typename std::enable_if<Header::IsHeader<H>::value, Stream&>::type
+    writeHeader(Stream& stream, Args&& ...args) {
+        H header(std::forward<Args>(args)...);
+        
+        stream << H::Name << ": ";
     header.write(stream);
 
     stream << crlf;
@@ -90,7 +92,7 @@ namespace {
         std::ostream os(&buf);
         for (const auto& cookie: cookies) {
             OUT(os << "Set-Cookie: ");
-            OUT(cookie.write(os));
+            OUT(os << cookie);
             OUT(os << crlf);
         }
 
@@ -98,6 +100,15 @@ namespace {
 
         #undef OUT
     }
+
+    using HttpMethods = std::unordered_map<std::string, Method>;
+
+    const HttpMethods httpMethods = {
+    #define METHOD(repr, str) \
+        { str, Method::repr },
+        HTTP_METHODS
+    #undef METHOD
+    };
 
 }
 
@@ -114,34 +125,19 @@ namespace Private {
     RequestLineStep::apply(StreamCursor& cursor) {
         StreamCursor::Revert revert(cursor);
 
-        // Method
-        //
-        struct MethodValue {
-            const char* const str;
-            const size_t len;
-
-            Method repr;
-        };
-
-        static constexpr MethodValue Methods[] = {
-        #define METHOD(repr, str) \
-            { str, sizeof(str) - 1, Method::repr },
-            HTTP_METHODS
-        #undef METHOD
-        };
-
         auto request = static_cast<Request *>(message);
 
-        bool found = false;
-        for (const auto& method: Methods) {
-            if (match_raw(method.str, method.len, cursor)) {
-                request->method_ = method.repr;
-                found = true;
-                break;
-            }
-        }
+        StreamCursor::Token methodToken(cursor);
+        if (!match_until(' ', cursor))
+            return State::Again;
 
-        if (!found) {
+        auto it = httpMethods.find(methodToken.text());
+        if (it != httpMethods.end())
+        {
+            request->method_ = it->second;
+        }
+        else
+        {
             raise("Unknown HTTP request method");
         }
 
@@ -229,10 +225,10 @@ namespace Private {
 
         auto *response = static_cast<Response *>(message);
 
-        if (match_raw("HTTP/1.1", sizeof("HTTP/1.1") - 1, cursor)) {
+        if (match_raw("HTTP/1.1", strlen("HTTP/1.1"), cursor)) {
             //response->version = Version::Http11;
         }
-        else if (match_raw("HTTP/1.0", sizeof("HTTP/1.0") - 1, cursor)) {
+        else if (match_raw("HTTP/1.0", strlen("HTTP/1.0"), cursor)) {
         }
         else {
             raise("Encountered invalid HTTP version");
@@ -256,7 +252,10 @@ namespace Private {
 
         if (!cursor.advance(1)) return State::Again;
 
-        while (!cursor.eol()) cursor.advance(1);
+        while (!cursor.eol() && !cursor.eof())
+        {
+            cursor.advance(1);
+        }
 
         if (!cursor.advance(2)) return State::Again;
 
@@ -294,13 +293,14 @@ namespace Private {
             }
 
             if (name == "Cookie") {
-                message->cookies_.add(
-                        Cookie::fromRaw(cursor.offset(start), cursor.diff(start))
-                );
+                message->cookies_.removeAllCookies(); // removing existing cookies before re-adding them.
+                message->cookies_.addFromRaw(cursor.offset(start), cursor.diff(start));
             }
-
-            else if (Header::Registry::isRegistered(name)) {
-                std::shared_ptr<Header::Header> header = Header::Registry::makeHeader(name);
+            else if (name == "Set-Cookie") {
+                message->cookies_.add(Cookie::fromRaw(cursor.offset(start), cursor.diff(start)));
+            }
+            else if (Header::Registry::instance().isRegistered(name)) {
+                std::shared_ptr<Header::Header> header = Header::Registry::instance().makeHeader(name);
                 header->parseRaw(cursor.offset(start), cursor.diff(start));
                 message->headers_.add(header);
             }
@@ -404,7 +404,7 @@ namespace Private {
 
         message->body_.reserve(size);
         StreamCursor::Token chunkData(cursor);
-        const size_t available = cursor.remaining();
+        const ssize_t available = cursor.remaining();
 
         if (available < size) {
             cursor.advance(available);
@@ -476,11 +476,16 @@ namespace Private {
 
 Message::Message()
     : version_(Version::Http11)
+    , code_()
+    , body_()
+    , cookies_()
+    , headers_()
 { }
 
 namespace Uri {
 
     Query::Query()
+        : params()
     { }
 
     Query::Query(std::initializer_list<std::pair<const std::string, std::string>> params)
@@ -501,6 +506,18 @@ namespace Uri {
         return Some(it->second);
     }
 
+    std::string
+    Query::as_str() const {
+        std::string query_url;
+        for(const auto &e : params) {
+            query_url += "&" + e.first + "=" + e.second;
+        }
+        if(!query_url.empty()) {
+            query_url[0] = '?'; // replace first `&` with `?`
+        }
+        return query_url;
+    }
+
     bool
     Query::has(const std::string& name) const {
         return params.find(name) != std::end(params);
@@ -508,9 +525,7 @@ namespace Uri {
 
 } // namespace Uri
 
-Request::Request()
-    : Message()
-{ }
+Request::Request() = default;
 
 Version
 Request::version() const {
@@ -584,8 +599,8 @@ ResponseStream::ResponseStream(
          * Correctly handle non-keep alive requests
          * Do not put Keep-Alive if version == Http::11 and request.keepAlive == true
         */
-        writeHeader<Header::Connection>(os, ConnectionControl::KeepAlive);
-        if (!os) throw Error("Response exceeded buffer size");
+        // writeHeader<Header::Connection>(os, ConnectionControl::KeepAlive);
+        // if (!os) throw Error("Response exceeded buffer size");
         writeHeader<Header::TransferEncoding>(os, Header::Encoding::Chunked);
         if (!os) throw Error("Response exceeded buffer size");
         os << crlf;
@@ -634,11 +649,18 @@ ResponseWriter::putOnWire(const char* data, size_t len)
         OUT(writeHeaders(headers_, buf_));
         OUT(writeCookies(cookies_, buf_));
 
+
+        auto connection = headers_.tryGet<Header::Connection>();
+        auto control = ConnectionControl::Close;
+
+        if (connection)
+            control = connection->control();
+
         /* @Todo @Major:
          * Correctly handle non-keep alive requests
          * Do not put Keep-Alive if version == Http::11 and request.keepAlive == true
         */
-        OUT(writeHeader<Header::Connection>(os, ConnectionControl::KeepAlive));
+        //OUT(writeHeader<Header::Connection>(os, ConnectionControl::KeepAlive));
         OUT(writeHeader<Header::ContentLength>(os, len));
 
         OUT(os << crlf);
@@ -654,7 +676,31 @@ ResponseWriter::putOnWire(const char* data, size_t len)
 #undef OUT
 
         auto fd = peer()->fd();
-        return transport_->asyncWrite(fd, buffer);
+
+        return transport_->asyncWrite(fd, buffer)
+         .then
+                 <
+                         std::function< Async::Promise<ssize_t>(int)>,
+                         std::function<void(std::exception_ptr&)>
+                 >
+                 (
+                         [=](int l) {
+
+                             return Async::Promise<ssize_t>( [=](Async::Deferred<ssize_t> deferred) mutable {
+
+                                 if (control == ConnectionControl::KeepAlive) return ;
+
+                                 if (fd)
+                                     close(fd);
+
+                                return ;
+                             } );
+                         },
+
+                         [=](std::exception_ptr& eptr){
+                             return Async::Promise<ssize_t>::rejected(eptr);
+                         }
+                 );
 
     } catch (const std::runtime_error& e) {
         return Async::Promise<ssize_t>::rejected(e);
@@ -662,19 +708,27 @@ ResponseWriter::putOnWire(const char* data, size_t len)
 }
 
 Async::Promise<ssize_t>
-serveFile(ResponseWriter& response, const char* fileName, const Mime::MediaType& contentType)
+serveFile(ResponseWriter& response, const std::string& fileName, const Mime::MediaType& contentType)
 {
     struct stat sb;
 
-    int fd = open(fileName, O_RDONLY);
+    int fd = open(fileName.c_str(), O_RDONLY);
     if (fd == -1) {
+        std::string str_error(strerror(errno));
+        if(errno == ENOENT) {
+            throw HttpError(Http::Code::Not_Found, std::move(str_error));
+        }
+        //eles if TODO
         /* @Improvement: maybe could we check for errno here and emit a different error
             message
         */
-        throw HttpError(Http::Code::Not_Found, "");
+        else {
+            throw HttpError(Http::Code::Internal_Server_Error, std::move(str_error));
+        }
     }
 
     int res = ::fstat(fd, &sb);
+    close(fd); // Done with fd, close before error can be thrown
     if (res == -1) {
         throw HttpError(Code::Internal_Server_Error, "");
     }
@@ -704,7 +758,7 @@ serveFile(ResponseWriter& response, const char* fileName, const Mime::MediaType&
     if (contentType.isValid()) {
         setContentType(contentType);
     } else {
-        auto mime = Mime::MediaType::fromFile(fileName);
+        auto mime = Mime::MediaType::fromFile(fileName.c_str());
         if (mime.isValid())
             setContentType(mime);
     }
@@ -722,7 +776,7 @@ serveFile(ResponseWriter& response, const char* fileName, const Mime::MediaType&
     auto sockFd = peer->fd();
 
     auto buffer = buf->buffer();
-    return transport->asyncWrite(sockFd, buffer, MSG_MORE).then([=](ssize_t bytes) {
+    return transport->asyncWrite(sockFd, buffer, MSG_MORE).then([=](ssize_t) {
         return transport->asyncWrite(sockFd, FileBuffer(fileName));
     }, Async::Throw);
 
@@ -739,6 +793,7 @@ Handler::onInput(const char* buffer, size_t len, const std::shared_ptr<Tcp::Peer
         }
 
         auto state = parser.parse();
+
         if (state == Private::State::Done) {
             ResponseWriter response(transport(), parser.request, this);
             response.associatePeer(peer);
@@ -746,15 +801,29 @@ Handler::onInput(const char* buffer, size_t len, const std::shared_ptr<Tcp::Peer
 #ifdef LIBSTDCPP_SMARTPTR_LOCK_FIXME
             parser.request.associatePeer(peer);
 #endif
-            onRequest(parser.request, std::move(response));
+
+            auto request = parser.request;
+            auto connection = request.headers().tryGet<Header::Connection>();
+
+            if (connection) {
+                response.headers()
+                    .add<Header::Connection>(connection->control());
+            } else {
+                response.headers()
+                        .add<Header::Connection>(ConnectionControl::Close);
+            }
+
+            onRequest(request, std::move(response));
             parser.reset();
         }
+
     } catch (const HttpError &err) {
         ResponseWriter response(transport(), parser.request, this);
         response.associatePeer(peer);
         response.send(static_cast<Code>(err.code()), err.reason());
         parser.reset();
     }
+
     catch (const std::exception& e) {
         ResponseWriter response(transport(), parser.request, this);
         response.associatePeer(peer);
@@ -770,14 +839,18 @@ Handler::onConnection(const std::shared_ptr<Tcp::Peer>& peer) {
 
 void
 Handler::onDisconnection(const shared_ptr<Tcp::Peer>& peer) {
+    UNUSED(peer)
 }
 
 void
 Handler::onTimeout(const Request& request, ResponseWriter response) {
+    UNUSED(request)
+    UNUSED(response)
 }
 
 void
 Timeout::onTimeout(uint64_t numWakeup) {
+    UNUSED(numWakeup)
     if (!peer.lock()) return;
 
     ResponseWriter response(transport, request, handler);
@@ -789,7 +862,7 @@ Timeout::onTimeout(uint64_t numWakeup) {
 
 Private::Parser<Http::Request>&
 Handler::getParser(const std::shared_ptr<Tcp::Peer>& peer) const {
-    return *peer->getData<Private::Parser<Http::Request>>(ParserData);
+    return static_cast<Private::Parser<Http::Request>&>(*peer->getData(ParserData));
 }
 
 

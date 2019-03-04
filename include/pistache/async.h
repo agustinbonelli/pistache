@@ -1,11 +1,13 @@
 /* async.h
    Mathieu Stefani, 05 novembre 2015
-   
+
   This header brings a Promise<T> class inspired by the Promises/A+
   specification for asynchronous operations
 */
 
 #pragma once
+
+#include <pistache/typeid.h>
 
 #include <type_traits>
 #include <functional>
@@ -14,9 +16,9 @@
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <stdexcept>
+#include <typeinfo>
 
-#include <pistache/optional.h>
-#include <pistache/typeid.h>
 
 namespace Pistache {
 namespace Async {
@@ -46,6 +48,7 @@ namespace Async {
     class BadAnyCast : public std::bad_cast {
     public:
         virtual const char* what() const noexcept { return "Bad any cast"; }
+        virtual ~BadAnyCast() { }
     };
 
     enum class State {
@@ -136,8 +139,8 @@ namespace Async {
     namespace Private {
 
         struct InternalRethrow {
-            InternalRethrow(std::exception_ptr exc)
-                : exc(std::move(exc))
+            InternalRethrow(std::exception_ptr _exc)
+                : exc(std::move(_exc))
             { }
 
             std::exception_ptr exc;
@@ -163,14 +166,20 @@ namespace Async {
         public:
             virtual void resolve(const std::shared_ptr<Core>& core) = 0;
             virtual void reject(const std::shared_ptr<Core>& core) = 0;
+            virtual ~Request() {}
         };
 
         struct Core {
-            Core(State state, TypeId id)
-                : state(state)
-                , id(id)
+            Core(State _state, TypeId _id)
+                : allocated(false)
+                , state(_state)
+                , exc()
+                , mtx()
+                , requests()
+                , id(_id)
             { }
 
+            bool allocated;
             State state;
             std::exception_ptr exc;
 
@@ -203,25 +212,38 @@ namespace Async {
                 }
 
                 void *mem = memory();
+
+                if (allocated) {
+                    reinterpret_cast<T*>(mem)->~T();
+                    allocated = false;
+                }
+
                 new (mem) T(std::forward<Args>(args)...);
+                allocated = true;
                 state = State::Fulfilled;
             }
 
+            virtual ~Core() {}
         };
 
         template<typename T>
         struct CoreT : public Core {
             CoreT()
                 : Core(State::Pending, TypeId::of<T>())
+                , storage()
             { }
 
+            ~CoreT() {
+                if (allocated) {
+                    reinterpret_cast<T*>(&storage)->~T();
+                    allocated = false;
+                }
+            }
+            
             template<class Other>
             struct Rebind {
                 typedef CoreT<Other> Type;
             };
-
-            typedef typename std::aligned_storage<sizeof(T), alignof(T)>::type Storage;
-            Storage storage;
 
             T& value() {
                 if (state != State::Fulfilled)
@@ -230,11 +252,16 @@ namespace Async {
                 return *reinterpret_cast<T*>(&storage);
             }
 
-            bool isVoid() const { return false; }
+            bool isVoid() const override { return false; }
 
-            void *memory() {
+        protected:
+            void *memory() override {
                 return &storage;
             }
+
+        private:
+            typedef typename std::aligned_storage<sizeof(T), alignof(T)>::type Storage;
+            Storage storage;
         };
 
         template<>
@@ -243,9 +270,10 @@ namespace Async {
                 : Core(State::Pending, TypeId::of<void>())
             { }
 
-            bool isVoid() const { return true; }
+            bool isVoid() const override { return true; }
 
-            void *memory() {
+        protected:
+            void *memory() override {
                 return nullptr;
             }
         };
@@ -253,12 +281,12 @@ namespace Async {
         template<typename T>
         struct Continuable : public Request {
             Continuable(const std::shared_ptr<Core>& chain)
-                : chain_(chain)
-                , resolveCount_(0)
+                : resolveCount_(0)
                 , rejectCount_(0)
+                , chain_(chain)
             { }
 
-            void resolve(const std::shared_ptr<Core>& core) {
+            void resolve(const std::shared_ptr<Core>& core) override {
                 if (resolveCount_ >= 1)
                     throw Error("Resolve must not be called more than once");
 
@@ -266,7 +294,7 @@ namespace Async {
                 ++resolveCount_;
             }
 
-            void reject(const std::shared_ptr<Core>& core) {
+            void reject(const std::shared_ptr<Core>& core) override {
                 if (rejectCount_ >= 1)
                     throw Error("Reject must not be called more than once");
 
@@ -289,6 +317,8 @@ namespace Async {
 
             virtual void doResolve(const std::shared_ptr<CoreT<T>>& core) = 0;
             virtual void doReject(const std::shared_ptr<CoreT<T>>& core) = 0;
+
+            virtual ~Continuable() { }
 
             size_t resolveCount_;
             size_t rejectCount_;
@@ -386,7 +416,7 @@ namespace Async {
                 static_assert(sizeof...(Args) == 0,
                         "Can not attach a non-void continuation to a void-Promise");
 
-                void doResolve(const std::shared_ptr<CoreT<void>>& core) {
+                void doResolve(const std::shared_ptr<CoreT<void>>& /*core*/) {
                     finishResolve(resolve_());
                 }
 
@@ -463,7 +493,7 @@ namespace Async {
                 static_assert(sizeof...(Args) == 0,
                         "Can not attach a non-void continuation to a void-Promise");
 
-                void doResolve(const std::shared_ptr<CoreT<void>>& core) {
+                void doResolve(const std::shared_ptr<CoreT<void>>& /*core*/) {
                     resolve_();
                 }
 
@@ -570,7 +600,7 @@ namespace Async {
                     , reject_(reject)
                 { }
 
-                void doResolve(const std::shared_ptr<CoreT<void>>& core) {
+                void doResolve(const std::shared_ptr<CoreT<void>>& /*core*/) {
                     auto promise = resolve_();
                     finishResolve(promise);
                 }
@@ -722,7 +752,7 @@ namespace Async {
         Resolver& operator=(const Resolver& other) = delete;
 
         Resolver(Resolver&& other) = default;
-        Resolver& operator=(Resolver&& other) = default; 
+        Resolver& operator=(Resolver&& other) = default;
 
         template<typename Arg>
         bool operator()(Arg&& arg) const {
@@ -839,9 +869,9 @@ namespace Async {
         Deferred(Deferred&& other) = default;
         Deferred& operator=(Deferred&& other) = default;
 
-        Deferred(Resolver resolver, Rejection reject)
-            : resolver(std::move(resolver))
-            , rejection(std::move(reject))
+        Deferred(Resolver _resolver, Rejection _reject)
+            : resolver(std::move(_resolver))
+            , rejection(std::move(_reject))
         { }
 
         template<typename U>
@@ -855,7 +885,7 @@ namespace Async {
         }
 
         template<typename... Args>
-        void emplaceResolve(Args&& ...args) {
+        void emplaceResolve(Args&& ...) {
         }
 
         template<typename Exc>
@@ -888,9 +918,9 @@ namespace Async {
         Deferred(Deferred&& other) = default;
         Deferred& operator=(Deferred&& other) = default;
 
-        Deferred(Resolver resolver, Rejection reject)
-            : resolver(std::move(resolver))
-            , rejection(std::move(reject))
+        Deferred(Resolver _resolver, Rejection _reject)
+            : resolver(std::move(_resolver))
+            , rejection(std::move(_reject))
         { }
 
         void resolve() {
@@ -898,8 +928,8 @@ namespace Async {
         }
 
         template<typename Exc>
-        void reject(Exc exc) {
-            rejection(std::move(exc));
+        void reject(Exc _exc) {
+            rejection(std::move(_exc));
         }
 
     private:
@@ -932,7 +962,7 @@ namespace Async {
             -> decltype(std::declval<Func>()(Deferred<T>()), void()) {
             func(Deferred<T>(std::move(resolver), std::move(rejection)));
         }
-   };
+   }
 
     template<typename T>
     class Promise : public PromiseBase
@@ -947,7 +977,7 @@ namespace Async {
             : core_(std::make_shared<Core>())
             , resolver_(core_)
             , rejection_(core_)
-        { 
+        {
             details::callAsync<T>(func, resolver_, rejection_);
         }
 
@@ -957,8 +987,9 @@ namespace Async {
         Promise(Promise<T>&& other) = default;
         Promise& operator=(Promise<T>&& other) = default;
 
-        ~Promise()
+        virtual ~Promise()
         {
+
         }
 
         template<typename U>
@@ -995,9 +1026,9 @@ namespace Async {
             return Promise<T>(std::move(core));
         }
 
-        bool isPending() const { return core_->state == State::Pending; }
-        bool isFulfilled() const { return core_->state == State::Fulfilled; }
-        bool isRejected() const { return core_->state == State::Rejected; }
+        bool isPending() const override { return core_->state == State::Pending; }
+        bool isFulfilled() const override { return core_->state == State::Fulfilled; }
+        bool isRejected() const override { return core_->state == State::Rejected; }
 
         template<typename ResolveFunc, typename RejectFunc>
         auto
@@ -1138,12 +1169,12 @@ namespace Async {
         struct All {
 
             struct Data {
-                Data(const size_t total, Resolver resolver, Rejection rejection)
-                    : total(total)
+                Data(const size_t _total, Resolver _resolver, Rejection _rejection)
+                    : total(_total)
                     , resolved(0)
                     , rejected(false)
-                    , resolve(std::move(resolver))
-                    , reject(std::move(rejection))
+                    , resolve(std::move(_resolver))
+                    , reject(std::move(_rejection))
                 { }
 
                 const size_t total;
@@ -1245,8 +1276,8 @@ namespace Async {
         private:
             template<typename T, size_t Index, typename Data>
             struct WhenContinuation {
-                WhenContinuation(Data data)
-                    : data(std::move(data))
+                WhenContinuation(Data _data)
+                    : data(std::move(_data))
                 { }
 
                 void operator()(const T& val) const {
@@ -1258,8 +1289,8 @@ namespace Async {
 
             template<size_t Index, typename Data>
             struct WhenContinuation<void, Index, Data> {
-                WhenContinuation(Data data)
-                    : data(std::move(data))
+                WhenContinuation(Data _data)
+                    : data(std::move(_data))
                 { }
 
                 void operator()() const {
@@ -1339,16 +1370,16 @@ namespace Async {
                  typename T,
                  typename Results
                 >
-        struct WhenAllRange {
-
-            WhenAllRange(Resolver resolve, Rejection reject)
-                : resolve(std::move(resolve))
-                , reject(std::move(reject))
+        struct WhenAllRange
+        {
+            WhenAllRange(Resolver _resolve, Rejection _reject)
+                : resolve(std::move(_resolve))
+                , reject(std::move(_reject))
             { }
 
             template<typename Iterator>
-            void operator()(Iterator first, Iterator last) {
-
+            void operator()(Iterator first, Iterator last)
+            {
                 auto data = std::make_shared<DataT<T>>(
                    static_cast<size_t>(std::distance(first, last)),
                    std::move(resolve),
@@ -1361,9 +1392,11 @@ namespace Async {
                     WhenContinuation<T> cont(data, index);
 
                     it->then(std::move(cont), [=](std::exception_ptr ptr) {
+                        std::lock_guard<std::mutex> guard(data->mtx);
+
                         if (data->rejected) return;
 
-                        data->rejected.store(true);
+                        data->rejected = true;
                         data->reject(std::move(ptr));
                     });
 
@@ -1372,22 +1405,24 @@ namespace Async {
             }
 
         private:
-            struct Data {
-                Data(size_t total, Resolver resolver, Rejection rejection)
-                    : total(total)
+            struct Data
+            {
+                Data(size_t _total, Resolver _resolver, Rejection _rejection)
+                    : total(_total)
                     , resolved(0)
                     , rejected(false)
-                    , resolve(std::move(resolver))
-                    , reject(std::move(rejection))
+                    , mtx()
+                    , resolve(std::move(_resolver))
+                    , reject(std::move(_rejection))
                 { }
 
                 const size_t total;
-                std::atomic<size_t> resolved;
-                std::atomic<bool> rejected;
+                size_t resolved;
+                bool rejected;
+                std::mutex mtx;
 
                 Resolver resolve;
                 Rejection reject;
-
             };
 
             /* Ok so apparently I can not fully specialize a template structure
@@ -1415,22 +1450,25 @@ namespace Async {
             };
 
             template<typename ValueType, typename Dummy = void>
-            struct WhenContinuation {
+            struct WhenContinuation
+            {
+                using D = std::shared_ptr<DataT<ValueType>>;
 
-                typedef std::shared_ptr<DataT<ValueType>> D;
-
-                WhenContinuation(const D& data, size_t index)
-                    : data(data)
-                    , index(index)
+                WhenContinuation(const D& _data, size_t _index)
+                    : data(_data)
+                    , index(_index)
                 { }
 
-                void operator()(const ValueType& val) const {
+                void operator()(const ValueType& val) const
+                {
+                    std::lock_guard<std::mutex> guard(data->mtx);
+
                     if (data->rejected) return;
 
                     data->results[index] = val;
-                    data->resolved.fetch_add(1);
-
-                    if (data->resolved == data->total) {
+                    data->resolved++;
+                    if (data->resolved == data->total)
+                    {
                         data->resolve(data->results);
                     }
                 }
@@ -1440,20 +1478,23 @@ namespace Async {
             };
 
             template<typename Dummy>
-            struct WhenContinuation<void, Dummy> {
+            struct WhenContinuation<void, Dummy>
+            {
+                using D = std::shared_ptr<DataT<void>>;
 
-                typedef std::shared_ptr<DataT<void>> D;
-
-                WhenContinuation(const D& data, size_t)
-                    : data(data)
+                WhenContinuation(const D& _data, size_t)
+                    : data(_data)
                 { }
 
-                void operator()() const {
+                void operator()() const
+                {
+                    std::lock_guard<std::mutex> guard(data->mtx);
+
                     if (data->rejected) return;
 
-                    data->resolved.fetch_add(1);
-
-                    if (data->resolved == data->total) {
+                    data->resolved++;
+                    if (data->resolved == data->total)
+                    {
                         data->resolve();
                     }
                 }

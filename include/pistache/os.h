@@ -1,6 +1,6 @@
 /* os.h
    Mathieu Stefani, 13 August 2015
-   
+
    Operating system specific functions
 */
 
@@ -18,9 +18,9 @@
 
 namespace Pistache {
 
-typedef int Fd;
+using Fd = int;
 
-int hardware_concurrency();
+uint hardware_concurrency();
 bool make_non_blocking(int fd);
 
 class CpuSet {
@@ -65,7 +65,7 @@ enum class NotifyOn {
     Shutdown = Read << 3
 };
 
-DECLARE_FLAGS_OPERATORS(NotifyOn);
+DECLARE_FLAGS_OPERATORS(NotifyOn)
 
 struct Tag {
     friend class Epoll;
@@ -87,8 +87,10 @@ inline constexpr bool operator==(Tag lhs, Tag rhs) {
 }
 
 struct Event {
-    explicit Event(Tag tag) :
-        tag(tag)
+    explicit Event(Tag _tag)
+        : flags()
+        , fd(-1)
+        , tag(_tag)
     { }
 
     Flags<NotifyOn> flags;
@@ -111,8 +113,8 @@ public:
              std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) const;
 
 private:
-    int toEpollEvents(Flags<NotifyOn> interest) const;
-    Flags<NotifyOn> toNotifyOn(int events) const;
+    static int toEpollEvents(const Flags<NotifyOn>& interest);
+    static Flags<NotifyOn> toNotifyOn(int events);
     int epoll_fd;
 };
 

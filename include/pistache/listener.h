@@ -19,6 +19,10 @@
 #include <pistache/async.h>
 #include <pistache/reactor.h>
 
+#ifdef PISTACHE_USE_SSL
+#include <openssl/ssl.h>
+#endif /* PISTACHE_USE_SSL */
+
 namespace Pistache {
 namespace Tcp {
 
@@ -31,7 +35,7 @@ class Listener {
 public:
 
     struct Load {
-        typedef std::chrono::system_clock::time_point TimePoint;
+        using TimePoint = std::chrono::system_clock::time_point;
         double global;
         std::vector<double> workers;
 
@@ -42,17 +46,18 @@ public:
     Listener();
     ~Listener();
 
-    Listener(const Address& address);
+    explicit Listener(const Address& address);
     void init(
             size_t workers,
             Flags<Options> options = Options::None,
             int backlog = Const::MaxBacklog);
     void setHandler(const std::shared_ptr<Handler>& handler);
 
-    bool bind();
-    bool bind(const Address& adress);
+    void bind();
+    void bind(const Address& address);
 
     bool isBound() const;
+    Port getPort() const;
 
     void run();
     void runThreaded();
@@ -66,26 +71,31 @@ public:
 
     void pinWorker(size_t worker, const CpuSet& set);
 
+    void setupSSL(const std::string &cert_path, const std::string &key_path, bool use_compression);
+    void setupSSLAuth(const std::string &ca_file, const std::string &ca_path, int (*cb)(int, void *));
+
 private: 
-    Address addr_; 
+    Address addr_;
     int listen_fd;
     int backlog_;
     NotifyFd shutdownFd;
     Polling::Epoll poller;
 
     Flags<Options> options_;
-    std::unique_ptr<std::thread> acceptThread;
+    std::thread acceptThread;
 
     size_t workers_;
-    std::shared_ptr<Transport> transport_;
     std::shared_ptr<Handler> handler_;
 
-    std::shared_ptr<Aio::Reactor> reactor_;
+    Aio::Reactor reactor_;
     Aio::Reactor::Key transportKey;
 
     void handleNewConnection();
+    int acceptConnection(struct sockaddr_in& peer_addr) const;
     void dispatchPeer(const std::shared_ptr<Peer>& peer);
 
+    bool useSSL_;
+    void *ssl_ctx_;
 };
 
 } // namespace Tcp

@@ -1,16 +1,23 @@
-/* 
+/*
    Mathieu Stefani, 15 juin 2016
-   
+
    Implementation of the Reactor
 */
 
 #include <pistache/reactor.h>
 
+#include <array>
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 namespace Pistache {
 namespace Aio {
 
-struct Reactor::Impl {
-
+class Reactor::Impl {
+public:
     Impl(Reactor* reactor)
         : reactor_(reactor)
     { }
@@ -55,8 +62,8 @@ struct Reactor::Impl {
 /* Synchronous implementation of the reactor that polls in the context
  * of the same thread
  */
-struct SyncImpl : public Reactor::Impl {
-
+class SyncImpl : public Reactor::Impl {
+public:
     SyncImpl(Reactor* reactor)
         : Reactor::Impl(reactor)
         , handlers_()
@@ -68,7 +75,7 @@ struct SyncImpl : public Reactor::Impl {
     }
 
     Reactor::Key addHandler(
-            const std::shared_ptr<Handler>& handler, bool setKey = true) {
+            const std::shared_ptr<Handler>& handler, bool setKey = true) override {
 
         handler->registerPoller(poller);
 
@@ -84,7 +91,7 @@ struct SyncImpl : public Reactor::Impl {
         return handlers_[key.data()];
     }
 
-    std::vector<std::shared_ptr<Handler>> handlers(const Reactor::Key& key) const {
+    std::vector<std::shared_ptr<Handler>> handlers(const Reactor::Key& key) const override {
         std::vector<std::shared_ptr<Handler>> res;
 
         res.push_back(handler(key));
@@ -96,7 +103,7 @@ struct SyncImpl : public Reactor::Impl {
             Fd fd,
             Polling::NotifyOn interest,
             Polling::Tag tag,
-            Polling::Mode mode = Polling::Mode::Level) {
+            Polling::Mode mode = Polling::Mode::Level) override {
 
         auto pollTag = encodeTag(key, tag);
         poller.addFd(fd, interest, pollTag, mode);
@@ -107,7 +114,7 @@ struct SyncImpl : public Reactor::Impl {
             Fd fd,
             Polling::NotifyOn interest,
             Polling::Tag tag,
-            Polling::Mode mode = Polling::Mode::Level) {
+            Polling::Mode mode = Polling::Mode::Level) override {
 
         auto pollTag = encodeTag(key, tag);
         poller.addFdOneShot(fd, interest, pollTag, mode);
@@ -118,13 +125,13 @@ struct SyncImpl : public Reactor::Impl {
             Fd fd,
             Polling::NotifyOn interest,
             Polling::Tag tag,
-            Polling::Mode mode = Polling::Mode::Level) {
+            Polling::Mode mode = Polling::Mode::Level) override {
 
         auto pollTag = encodeTag(key, tag);
         poller.rearmFd(fd, interest, pollTag, mode);
     }
 
-    void runOnce() {
+    void runOnce() override {
         if (handlers_.empty())
             throw std::runtime_error("You need to set at least one handler");
 
@@ -146,7 +153,7 @@ struct SyncImpl : public Reactor::Impl {
         }
     }
 
-    void run() {
+    void run() override {
         handlers_.forEachHandler([](const std::shared_ptr<Handler> handler) {
             handler->context_.tid = std::this_thread::get_id();
         });
@@ -155,7 +162,7 @@ struct SyncImpl : public Reactor::Impl {
             runOnce();
     }
 
-    void shutdown() {
+    void shutdown() override {
         shutdown_.store(true);
         shutdownFd.notify();
     }
@@ -269,7 +276,7 @@ private:
             // to shift the value to retrieve the fd if there is only one handler as
             // all the bits will already be set to 0.
             auto encodedValue = (index << HandlerShift) | value;
-            return Polling::Tag(value);
+            return Polling::Tag(encodedValue);
         }
 
         static std::pair<size_t, uint64_t> decodeTag(const Polling::Tag& tag) {
@@ -325,7 +332,8 @@ private:
  * 32 bits to retrieve the index of the handler.
  */
 
-struct AsyncImpl : public Reactor::Impl {
+class AsyncImpl : public Reactor::Impl {
+public:
 
     static constexpr uint32_t KeyMarker = 0xBADB0B;
 
@@ -339,7 +347,7 @@ struct AsyncImpl : public Reactor::Impl {
     }
 
     Reactor::Key addHandler(
-            const std::shared_ptr<Handler>& handler, bool) {
+            const std::shared_ptr<Handler>& handler, bool) override {
 
         Reactor::Key keys[SyncImpl::MaxHandlers()];
 
@@ -359,7 +367,7 @@ struct AsyncImpl : public Reactor::Impl {
         return Reactor::Key(data);
     }
 
-    std::vector<std::shared_ptr<Handler>> handlers(const Reactor::Key& key) const {
+    std::vector<std::shared_ptr<Handler>> handlers(const Reactor::Key& key) const override {
 
         uint32_t idx;
         uint32_t marker;
@@ -383,7 +391,7 @@ struct AsyncImpl : public Reactor::Impl {
             Fd fd,
             Polling::NotifyOn interest,
             Polling::Tag tag,
-            Polling::Mode mode = Polling::Mode::Level) {
+            Polling::Mode mode = Polling::Mode::Level) override {
         dispatchCall(key, &SyncImpl::registerFd, fd, interest, tag, mode);
     }
 
@@ -392,7 +400,7 @@ struct AsyncImpl : public Reactor::Impl {
             Fd fd,
             Polling::NotifyOn interest,
             Polling::Tag tag,
-            Polling::Mode mode = Polling::Mode::Level) {
+            Polling::Mode mode = Polling::Mode::Level) override {
         dispatchCall(key, &SyncImpl::registerFdOneShot, fd, interest, tag, mode);
     }
 
@@ -401,19 +409,19 @@ struct AsyncImpl : public Reactor::Impl {
             Fd fd,
             Polling::NotifyOn interest,
             Polling::Tag tag,
-            Polling::Mode mode = Polling::Mode::Level) {
+            Polling::Mode mode = Polling::Mode::Level) override {
         dispatchCall(key, &SyncImpl::modifyFd, fd, interest, tag, mode);
     }
 
-    void runOnce() {
+    void runOnce() override {
     }
 
-    void run() {
+    void run() override {
         for (auto& wrk: workers_)
             wrk->run();
     }
 
-    void shutdown() {
+    void shutdown() override {
         for (auto& wrk: workers_)
             wrk->shutdown();
     }
@@ -453,21 +461,21 @@ private:
         }
 
         ~Worker() {
-            if (thread)
-                thread->join();
+            if (thread.joinable())
+                thread.join();
         }
 
         void run() {
-            thread.reset(new std::thread([=]() {
+            thread = std::thread([=]() {
                 sync->run();
-            }));
+            });
         }
 
         void shutdown() {
             sync->shutdown();
         }
 
-        std::unique_ptr<std::thread> thread;
+        std::thread thread;
         std::unique_ptr<SyncImpl> sync;
     };
 

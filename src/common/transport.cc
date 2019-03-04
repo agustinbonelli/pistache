@@ -49,10 +49,14 @@ Transport::handleNewPeer(const std::shared_ptr<Tcp::Peer>& peer) {
     const bool isInRightThread = std::this_thread::get_id() == ctx.thread();
     if (!isInRightThread) {
         PeerEntry entry(peer);
-        auto *e = peersQueue.allocEntry(entry);
-        peersQueue.push(e);
+        peersQueue.push(std::move(entry));
     } else {
         handlePeer(peer);
+    }
+    int fd = peer->fd();
+    {
+        Guard guard(toWriteLock);
+        toWrite.emplace(fd, std::deque<WriteEntry>{});
     }
 }
 
@@ -74,7 +78,6 @@ Transport::onReady(const Aio::FdSet& fds) {
 
         else if (entry.isReadable()) {
             auto tag = entry.getTag();
-            auto val = tag.value();
             if (isPeerFd(tag)) {
                 auto& peer = getPeer(tag);
                 handleIncoming(peer);
@@ -82,7 +85,7 @@ Transport::onReady(const Aio::FdSet& fds) {
                 auto it = timers.find(tag.value());
                 auto& entry = it->second;
                 handleTimer(std::move(entry));
-                timers.erase(it);
+                timers.erase(it->first);
             }
             else {
                 throw std::runtime_error("Unknown fd");
@@ -93,15 +96,18 @@ Transport::onReady(const Aio::FdSet& fds) {
             auto tag = entry.getTag();
             auto fd = tag.value();
 
-            auto it = toWrite.find(fd);
-            if (it == std::end(toWrite)) {
-                throw std::runtime_error("Assertion Error: could not find write data");
+            {
+                Guard guard(toWriteLock);
+                auto it = toWrite.find(fd);
+                if (it == std::end(toWrite)) {
+                    throw std::runtime_error("Assertion Error: could not find write data");
+                }
             }
 
             reactor()->modifyFd(key(), fd, NotifyOn::Read, Polling::Mode::Edge);
 
-            auto& write = it->second;
-            asyncWriteImpl(fd, write, Retry);
+            // Try to drain the queue
+            asyncWriteImpl(fd);
         }
     }
 }
@@ -118,8 +124,7 @@ Transport::disarmTimer(Fd fd) {
 
 void
 Transport::handleIncoming(const std::shared_ptr<Peer>& peer) {
-    char buffer[Const::MaxBuffer];
-    memset(buffer, 0, sizeof buffer);
+    char buffer[Const::MaxBuffer] = {0};
 
     ssize_t totalBytes = 0;
     int fd = peer->fd();
@@ -128,7 +133,17 @@ Transport::handleIncoming(const std::shared_ptr<Peer>& peer) {
 
         ssize_t bytes;
 
-        bytes = recv(fd, buffer + totalBytes, Const::MaxBuffer - totalBytes, 0);
+#ifdef PISTACHE_USE_SSL
+        if (peer->ssl() != NULL) {
+            bytes = SSL_read((SSL *)peer->ssl(), buffer + totalBytes,
+                Const::MaxBuffer - totalBytes);
+        } else {
+#endif /* PISTACHE_USE_SSL */
+            bytes = recv(fd, buffer + totalBytes, Const::MaxBuffer - totalBytes, 0);
+#ifdef PISTACHE_USE_SSL
+        }
+#endif /* PISTACHE_USE_SSL */
+
         if (bytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (totalBytes > 0) {
@@ -150,11 +165,7 @@ Transport::handleIncoming(const std::shared_ptr<Peer>& peer) {
         }
 
         else {
-            totalBytes += bytes;
-            if (totalBytes >= Const::MaxBuffer) {
-                std::cerr << "Too long packet" << std::endl;
-                break;
-            }
+            handler_->onInput(buffer, bytes, peer);
         }
     }
 }
@@ -168,69 +179,117 @@ Transport::handlePeerDisconnection(const std::shared_ptr<Peer>& peer) {
     if (it == std::end(peers))
         throw std::runtime_error("Could not find peer to erase");
 
-    peers.erase(it);
+#ifdef PISTACHE_USE_SSL
+    if (peer->ssl() != NULL) {
+        SSL_free((SSL *)peer->ssl());
+    }
+#endif /* PISTACHE_USE_SSL */
+
+    peers.erase(it->first);
+
+    {
+        // Clean up buffers
+        Guard guard(toWriteLock);
+        auto & wq = toWrite[fd];
+        while (wq.size() > 0) {
+            wq.pop_front();
+        }
+        toWrite.erase(fd);
+    }
 
     close(fd);
 }
 
 void
-Transport::asyncWriteImpl(Fd fd, Transport::WriteEntry& entry, WriteStatus status) {
-    asyncWriteImpl(fd, entry.flags, entry.buffer, std::move(entry.deferred), status);
-}
-
-void
-Transport::asyncWriteImpl(
-        Fd fd, int flags, const BufferHolder& buffer,
-        Async::Deferred<ssize_t> deferred, WriteStatus status)
+Transport::asyncWriteImpl(Fd fd)
 {
-    auto cleanUp = [&]() {
-        if (buffer.isRaw()) {
-            auto raw = buffer.raw();
-            if (raw.isOwned) delete[] raw.data;
-        }
+    bool stop = false;
+    while (!stop) {
+        Guard guard(toWriteLock);
 
-        if (status == Retry)
-            toWrite.erase(fd);
-    };
+        auto it = toWrite.find(fd);
 
-    ssize_t totalWritten = buffer.offset();
-    for (;;) {
-        ssize_t bytesWritten = 0;
-        auto len = buffer.size() - totalWritten;
-        if (buffer.isRaw()) {
-            auto raw = buffer.raw();
-            auto ptr = raw.data + totalWritten;
-            bytesWritten = ::send(fd, ptr, len, flags);
-        } else {
-            auto file = buffer.fd();
-            off_t offset = totalWritten;
-            bytesWritten = ::sendfile(fd, file, &offset, len);
-        }
-        if (bytesWritten < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // save for a future retry with the totalWritten offset.
-                if (status == Retry) {
-                    toWrite.erase(fd);
-                }
-
-                toWrite.insert(
-                        std::make_pair(fd,
-                            WriteEntry(std::move(deferred), buffer.detach(totalWritten), flags)));
-
-                reactor()->modifyFd(key(), fd, NotifyOn::Read | NotifyOn::Write, Polling::Mode::Edge);
-            }
-            else {
-                cleanUp();
-                deferred.reject(Pistache::Error::system("Could not write data"));
-            }
+        // cleanup will have been handled by handlePeerDisconnection
+        if (it == std::end(toWrite)) { return; }
+        auto & wq = it->second;
+        if (wq.size() == 0) {
             break;
         }
-        else {
-            totalWritten += bytesWritten;
-            if (totalWritten >= buffer.size()) {
-                cleanUp();
-                deferred.resolve(totalWritten);
+
+        auto & entry = wq.front();
+        int flags    = entry.flags;
+        BufferHolder &buffer = entry.buffer;
+        Async::Deferred<ssize_t> deferred = std::move(entry.deferred);
+
+        auto cleanUp = [&]() {
+            wq.pop_front();
+            if (wq.size() == 0) {
+                toWrite.erase(fd);
+                reactor()->modifyFd(key(), fd, NotifyOn::Read, Polling::Mode::Edge);
+                stop = true;
+            }
+        };
+
+        size_t totalWritten = buffer.offset();
+        for (;;) {
+            ssize_t bytesWritten = 0;
+            auto len = buffer.size() - totalWritten;
+
+            if (buffer.isRaw()) {
+                auto raw = buffer.raw();
+                auto ptr = raw.data().c_str() + totalWritten;
+
+#ifdef PISTACHE_USE_SSL
+                auto it = peers.find(fd);
+
+                if (it == std::end(peers))
+                    throw std::runtime_error("No peer found for fd: " + std::to_string(fd));
+
+                if (it->second->ssl() != NULL) {
+                    bytesWritten = SSL_write((SSL *)it->second->ssl(), ptr, len);
+                } else {
+#endif /* PISTACHE_USE_SSL */
+                    bytesWritten = ::send(fd, ptr, len, flags);
+#ifdef PISTACHE_USE_SSL
+                }
+#endif /* PISTACHE_USE_SSL */
+            } else {
+                auto file = buffer.fd();
+                off_t offset = totalWritten;
+                bytesWritten = ::sendfile(fd, file, &offset, len);
+            }
+            if (bytesWritten < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+
+                    auto bufferHolder = buffer.detach(totalWritten);
+
+                    // pop_front kills buffer - so we cannot continue loop or use buffer after this point
+                    wq.pop_front();
+                    wq.push_front(WriteEntry(std::move(deferred), bufferHolder, flags));
+                    reactor()->modifyFd(key(), fd, NotifyOn::Read | NotifyOn::Write, Polling::Mode::Edge);
+                }
+                else {
+                    cleanUp();
+                    deferred.reject(Pistache::Error::system("Could not write data"));
+                }
                 break;
+            }
+            else {
+                totalWritten += bytesWritten;
+                if (totalWritten >= buffer.size()) {
+                    if (buffer.isFile()) {
+                        // done with the file buffer, nothing else knows whether to
+                        // close it with the way the code is written.
+                        ::close(buffer.fd());
+                    }
+
+                    cleanUp();
+
+                    // Cast to match the type of defered template
+                    // to avoid a BadType exception
+                    deferred.resolve(static_cast<ssize_t>(totalWritten));
+                    break;
+                }
             }
         }
     }
@@ -246,8 +305,7 @@ Transport::armTimerMs(
     TimerEntry entry(fd, value, std::move(deferred));
 
     if (!isInRightThread) {
-        auto *e = timersQueue.allocEntry(std::move(entry));
-        timersQueue.push(e);
+        timersQueue.push(std::move(entry));
     } else {
         armTimerMsImpl(std::move(entry));
     }
@@ -290,33 +348,38 @@ void
 Transport::handleWriteQueue() {
     // Let's drain the queue
     for (;;) {
-        auto entry = writesQueue.popSafe();
-        if (!entry) break;
+        auto write = writesQueue.popSafe();
+        if (!write) break;
 
-        auto &write = entry->data();
-        asyncWriteImpl(write.peerFd, write);
+        auto fd = write->peerFd;
+        if (!isPeerFd(fd)) continue;
+
+        {
+            Guard guard(toWriteLock);
+            toWrite[fd].push_back(std::move(*write));
+        }
+
+        reactor()->modifyFd(key(), fd, NotifyOn::Read | NotifyOn::Write, Polling::Mode::Edge);
     }
 }
 
 void
 Transport::handleTimerQueue() {
     for (;;) {
-        auto entry = timersQueue.popSafe();
-        if (!entry) break;
+        auto timer = timersQueue.popSafe();
+        if (!timer) break;
 
-        auto &timer = entry->data();
-        armTimerMsImpl(std::move(timer));
+        armTimerMsImpl(std::move(*timer));
     }
 }
 
 void
 Transport::handlePeerQueue() {
     for (;;) {
-        auto entry = peersQueue.popSafe();
-        if (!entry) break;
+        auto data = peersQueue.popSafe();
+        if (!data) break;
 
-        const auto &data = entry->data();
-        handlePeer(data.peer);
+        handlePeer(data->peer);
     }
 }
 

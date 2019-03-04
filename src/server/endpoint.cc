@@ -14,6 +14,9 @@ namespace Http {
 
 Endpoint::Options::Options()
     : threads_(1)
+    , flags_()
+    , backlog_(Const::MaxBacklog)
+    , maxPayload_(Const::DefaultMaxPayload)
 { }
 
 Endpoint::Options&
@@ -34,6 +37,12 @@ Endpoint::Options::backlog(int val) {
     return *this;
 }
 
+Endpoint::Options&
+Endpoint::Options::maxPayload(size_t val) {
+    maxPayload_ = val;
+    return *this;
+}
+
 Endpoint::Endpoint()
 { }
 
@@ -44,6 +53,7 @@ Endpoint::Endpoint(const Address& addr)
 void
 Endpoint::init(const Endpoint::Options& options) {
     listener.init(options.threads_, options.flags_);
+    ArrayStreamBuf<char>::maxSize = options.maxPayload_;
 }
 
 void
@@ -77,6 +87,33 @@ void
 Endpoint::shutdown()
 {
     listener.shutdown();
+}
+
+void
+Endpoint::useSSL(std::string cert, std::string key, bool use_compression)
+{
+#ifndef PISTACHE_USE_SSL
+    (void)cert;
+    (void)key;
+    (void)use_compression;
+    throw std::runtime_error("Pistache is not compiled with SSL support.");
+#else
+    listener.setupSSL(cert, key, use_compression);
+#endif /* PISTACHE_USE_SSL */
+}
+
+void
+Endpoint::useSSLAuth(std::string ca_file, std::string ca_path, int (*cb)(int, void *))
+{
+#ifndef PISTACHE_USE_SSL
+    (void)ca_file;
+    (void)ca_path;
+    (void)cb;
+    throw std::runtime_error("Pistache is not compiled with SSL support.");
+#else
+    listener.setupSSLAuth(ca_file, ca_path, cb);
+#endif /* PISTACHE_USE_SSL */
+
 }
 
 Async::Promise<Tcp::Listener::Load>

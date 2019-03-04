@@ -1,11 +1,12 @@
 /* os.cc
    Mathieu Stefani, 13 August 2015
-   
+
 */
 
 #include <fstream>
 #include <iterator>
 #include <algorithm>
+#include <thread>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -19,25 +20,18 @@ using namespace std;
 
 namespace Pistache {
 
-int hardware_concurrency() {
-    std::ifstream cpuinfo("/proc/cpuinfo");
-    if (cpuinfo) {
-        return std::count(std::istream_iterator<std::string>(cpuinfo),
-                          std::istream_iterator<std::string>(),
-                          std::string("processor"));
-    }
-
-    return sysconf(_SC_NPROCESSORS_ONLN);
+uint hardware_concurrency() {
+    return std::thread::hardware_concurrency();
 }
 
 
-bool make_non_blocking(int sfd)
+bool make_non_blocking(int fd)
 {
-    int flags = fcntl (sfd, F_GETFL, 0);
-    if (flags == -1) return false; 
+    int flags = fcntl (fd, F_GETFL, 0);
+    if (flags == -1) return false;
 
     flags |= O_NONBLOCK;
-    int ret = fcntl (sfd, F_SETFL, flags);
+    int ret = fcntl (fd, F_SETFL, flags);
     if (ret == -1) return false;
 
     return true;
@@ -139,7 +133,7 @@ CpuSet::toPosix() const {
     }
 
     return cpu_set;
-};
+}
 
 namespace Polling {
 
@@ -196,23 +190,21 @@ namespace Polling {
             ready_fds = epoll_wait(epoll_fd, evs, maxEvents, timeout.count());
         } while (ready_fds < 0 && errno == EINTR);
 
-        if (ready_fds > 0) {
-            for (int i = 0; i < ready_fds; ++i) {
-                const struct epoll_event *ev = evs + i;
+        for (int i = 0; i < ready_fds; ++i) {
+            const struct epoll_event *ev = evs + i;
 
-                const Tag tag(ev->data.u64);
+            const Tag tag(ev->data.u64);
 
-                Event event(tag);
-                event.flags = toNotifyOn(ev->events);
-                events.push_back(event);
-            }
+            Event event(tag);
+            event.flags = toNotifyOn(ev->events);
+            events.push_back(event);
         }
 
         return ready_fds;
     }
 
     int
-    Epoll::toEpollEvents(Flags<NotifyOn> interest) const {
+    Epoll::toEpollEvents(const Flags<NotifyOn>& interest) {
         int events = 0;
 
         if (interest.hasFlag(NotifyOn::Read))
@@ -228,7 +220,7 @@ namespace Polling {
     }
 
     Flags<NotifyOn>
-    Epoll::toNotifyOn(int events) const {
+    Epoll::toNotifyOn(int events) {
         Flags<NotifyOn> flags;
 
         if (events & EPOLLIN)

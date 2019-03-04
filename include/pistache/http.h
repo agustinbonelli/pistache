@@ -1,6 +1,6 @@
 /* http.h
    Mathieu Stefani, 13 August 2015
-   
+
    Http Layer
 */
 
@@ -9,7 +9,11 @@
 #include <type_traits>
 #include <stdexcept>
 #include <array>
+#include <vector>
 #include <sstream>
+#include <algorithm>
+#include <memory>
+#include <string>
 
 #include <sys/timerfd.h>
 
@@ -23,6 +27,7 @@
 #include <pistache/peer.h>
 #include <pistache/tcp.h>
 #include <pistache/transport.h>
+#include <pistache/view.h>
 
 namespace Pistache {
 namespace Http {
@@ -38,7 +43,7 @@ namespace details {
         static constexpr bool value =
             std::is_same<decltype(test<P>(nullptr)), prototype_tag>::value;
     };
-};
+}
 
 #define HTTP_PROTOTYPE(Class) \
     PROTOTYPE_OF(Pistache::Tcp::Handler, Class) \
@@ -46,7 +51,7 @@ namespace details {
 
 namespace Private {
     class ParserBase;
-    template<typename T> struct Parser;
+    template<typename T> class Parser;
     class RequestLineStep;
     class ResponseLineStep;
     class HeadersStep;
@@ -80,14 +85,14 @@ protected:
     Version version_;
     Code code_;
 
-    Header::Collection headers_;
     std::string body_;
 
     CookieJar cookies_;
+    Header::Collection headers_;
+
 };
 
 namespace Uri {
-    typedef std::string Fragment;
 
     class Query {
     public:
@@ -97,12 +102,36 @@ namespace Uri {
         void add(std::string name, std::string value);
         Optional<std::string> get(const std::string& name) const;
         bool has(const std::string& name) const;
+        // Return empty string or "?key1=value1&key2=value2" if query exist
+        std::string as_str() const;
 
         void clear() {
             params.clear();
         }
 
+        // \brief Return iterator to the beginning of the parameters map
+        std::unordered_map<std::string, std::string>::const_iterator
+          parameters_begin() const {
+            return params.begin();
+        }
+
+        // \brief Return iterator to the end of the parameters map
+        std::unordered_map<std::string, std::string>::const_iterator
+          parameters_end() const {
+            return params.end();
+        }
+
+        // \brief returns all parameters given in the query
+        std::vector<std::string> parameters() const {
+          std::vector<std::string> keys;
+          std::transform(params.begin(), params.end(), std::back_inserter(keys),
+            [](const std::unordered_map<std::string, std::string>::value_type
+               &pair) {return pair.first;});
+          return keys;
+        }
+
     private:
+        //first is key second is value
         std::unordered_map<std::string, std::string> params;
     };
 } // namespace Uri
@@ -117,6 +146,8 @@ public:
     friend class RequestBuilder;
     // @Todo: try to remove the need for friend-ness here
     friend class Client;
+
+    Request();
 
     Request(const Request& other) = default;
     Request& operator=(const Request& other) = default;
@@ -140,7 +171,7 @@ public:
         drop of 5x with that lock
 
         If this turns out to be a problem, we might be able to replace the weak_ptr
-        trick to detect peer disconnection by a plain old "observer" pointer to a 
+        trick to detect peer disconnection by a plain old "observer" pointer to a
         tcp connection with a "stale" state
     */
 #ifdef LIBSTDCPP_SMARTPTR_LOCK_FIXME
@@ -148,8 +179,6 @@ public:
 #endif
 
 private:
-    Request();
-
 #ifdef LIBSTDCPP_SMARTPTR_LOCK_FIXME
     void associatePeer(const std::shared_ptr<Tcp::Peer>& peer) {
         if (peer_.use_count() > 0)
@@ -179,22 +208,22 @@ public:
     Timeout(Timeout&& other)
         : handler(other.handler)
         , request(std::move(other.request))
-        , peer(std::move(other.peer))
         , transport(other.transport)
         , armed(other.armed)
         , timerFd(other.timerFd)
+        , peer(std::move(other.peer))
     {
         other.timerFd = -1;
     }
 
     Timeout& operator=(Timeout&& other) {
         handler = other.handler;
-        request = std::move(other.request);
-        peer = std::move(other.peer);
         transport = other.transport;
+        request = std::move(other.request);
         armed = other.armed;
         timerFd = other.timerFd;
         other.timerFd = -1;
+        peer = std::move(other.peer);
         return *this;
     }
 
@@ -230,23 +259,24 @@ public:
 
 private:
     Timeout(const Timeout& other)
-        : transport(other.transport)
-        , handler(other.handler)
+        : handler(other.handler)
         , request(other.request)
+        , transport(other.transport)
         , armed(other.armed)
         , timerFd(other.timerFd)
+        , peer()
     { }
 
-    Timeout(Tcp::Transport* transport,
-            Handler* handler,
-            Request request)
-        : transport(transport)
-        , handler(handler)
-        , request(std::move(request))
+    Timeout(Tcp::Transport* transport_,
+            Handler* handler_,
+            Request request_)
+        : handler(handler_)
+        , request(std::move(request_))
+        , transport(transport_)
         , armed(false)
         , timerFd(-1)
-    {
-    }
+        , peer()
+    { }
 
     template<typename Ptr>
     void associatePeer(const Ptr& ptr) {
@@ -257,12 +287,10 @@ private:
 
     Handler* handler;
     Request request;
-
-    std::weak_ptr<Tcp::Peer> peer;
-
     Tcp::Transport* transport;
     bool armed;
     Fd timerFd;
+    std::weak_ptr<Tcp::Peer> peer;
 };
 
 class ResponseStream : public Message {
@@ -290,6 +318,14 @@ public:
     template<typename T>
     friend
     ResponseStream& operator<<(ResponseStream& stream, const T& val);
+
+    std::streamsize write(const char * data, std::streamsize sz) {
+        std::ostream os(&buf_);
+        os << std::hex << sz << crlf;
+        os.write(data, sz);
+        os << crlf;
+        return sz;
+    }
 
     const Header::Collection& headers() const {
         return headers_;
@@ -360,11 +396,9 @@ public:
     friend class Private::ResponseLineStep;
     friend class Private::Parser<Http::Response>;
 
-    Response()
-        : Message()
-    { }
+    Response() = default;
 
-    Response(Version version)
+    explicit Response(Version version)
         : Message()
     {
         version_ = version;
@@ -409,7 +443,7 @@ class ResponseWriter : public Response {
 public:
     static constexpr size_t DefaultStreamSize = 512;
 
-    friend Async::Promise<ssize_t> serveFile(ResponseWriter&, const char *, const Mime::MediaType&);
+    friend Async::Promise<ssize_t> serveFile(ResponseWriter&, const std::string&, const Mime::MediaType&);
 
     friend class Handler;
     friend class Timeout;
@@ -511,6 +545,13 @@ public:
         return timeout_;
     }
 
+    std::shared_ptr<Tcp::Peer> peer() const {
+        if (peer_.expired())
+            throw std::runtime_error("Write failed: Broken pipe");
+
+        return peer_.lock();
+    }
+
     // Unsafe API
 
     DynamicStreamBuf *rdbuf() {
@@ -518,9 +559,9 @@ public:
     }
 
     DynamicStreamBuf *rdbuf(DynamicStreamBuf* other) {
+       UNUSED(other)
        throw std::domain_error("Unimplemented");
     }
-
 
     ResponseWriter clone() const {
         return ResponseWriter(*this);
@@ -529,9 +570,10 @@ public:
 private:
     ResponseWriter(Tcp::Transport* transport, Request request, Handler* handler)
         : Response(request.version())
+        , peer_()
         , buf_(DefaultStreamSize)
         , transport_(transport)
-        , timeout_(transport, handler, std::move(request)) 
+        , timeout_(transport, handler, std::move(request))
     { }
 
     ResponseWriter(const ResponseWriter& other)
@@ -541,13 +583,6 @@ private:
         , transport_(other.transport_)
         , timeout_(other.timeout_)
     { }
-
-    std::shared_ptr<Tcp::Peer> peer() const {
-        if (peer_.expired())
-            throw std::runtime_error("Write failed: Broken pipe");
-
-        return peer_.lock();
-    }
 
     template<typename Ptr>
     void associatePeer(const Ptr& peer) {
@@ -567,7 +602,7 @@ private:
 };
 
 Async::Promise<ssize_t> serveFile(
-        ResponseWriter& response, const char *fileName,
+        ResponseWriter& response, const std::string& fileName,
         const Mime::MediaType& contentType = Mime::MediaType());
 
 namespace Private {
@@ -579,6 +614,8 @@ namespace Private {
             : message(request)
         { }
 
+        virtual ~Step() = default;
+
         virtual State apply(StreamCursor& cursor) = 0;
 
         void raise(const char* msg, Code code = Code::Bad_Request);
@@ -586,45 +623,49 @@ namespace Private {
         Message *message;
     };
 
-    struct RequestLineStep : public Step {
+    class RequestLineStep : public Step {
+    public:
         RequestLineStep(Request* request)
             : Step(request)
         { }
 
-        State apply(StreamCursor& cursor);
+        State apply(StreamCursor& cursor) override;
     };
 
-    struct ResponseLineStep : public Step {
+    class ResponseLineStep : public Step {
+    public:
         ResponseLineStep(Response* response)
             : Step(response)
         { }
 
-        State apply(StreamCursor& cursor);
+        State apply(StreamCursor& cursor) override;
     };
 
-    struct HeadersStep : public Step {
+    class HeadersStep : public Step {
+    public:
         HeadersStep(Message* request)
             : Step(request)
         { }
 
-        State apply(StreamCursor& cursor);
+        State apply(StreamCursor& cursor) override;
     };
 
-    struct BodyStep : public Step {
-        BodyStep(Message* message)
-            : Step(message)
-            , chunk(message)
+    class BodyStep : public Step {
+    public:
+        BodyStep(Message* message_)
+            : Step(message_)
+            , chunk(message_)
             , bytesRead(0)
         { }
 
-        State apply(StreamCursor& cursor);
+        State apply(StreamCursor& cursor) override;
 
     private:
         struct Chunk {
             enum Result { Complete, Incomplete, Final };
 
-            Chunk(Message* message)
-              : message(message)
+            Chunk(Message* message_)
+              : message(message_)
               , bytesRead(0)
               , size(-1)
             { }
@@ -649,18 +690,14 @@ namespace Private {
         size_t bytesRead;
     };
 
-    struct ParserBase {
+    class ParserBase {
+    public:
         ParserBase()
-            : currentStep(0)
+            : buffer()
             , cursor(&buffer)
-        {
-        }
-
-        ParserBase(const char* data, size_t len)
-            : currentStep(0)
-            , cursor(&buffer)
-        {
-        }
+            , allSteps()
+            , currentStep(0)
+        { }
 
         ParserBase(const ParserBase& other) = delete;
         ParserBase(ParserBase&& other) = default;
@@ -668,9 +705,11 @@ namespace Private {
         bool feed(const char* data, size_t len);
         virtual void reset();
 
+        virtual ~ParserBase() { }
+
         State parse();
 
-        ArrayStreamBuf<Const::MaxBuffer> buffer;
+        ArrayStreamBuf<char> buffer;
         StreamCursor cursor;
 
     protected:
@@ -681,12 +720,16 @@ namespace Private {
 
     };
 
-    template<typename Message> struct Parser;
+    template<typename Message> class Parser;
 
-    template<> struct Parser<Http::Request> : public ParserBase {
+    template<> class Parser<Http::Request> : public ParserBase {
+
+    public:
+
         Parser()
             : ParserBase()
-        { 
+            , request()
+        {
             allSteps[0].reset(new RequestLineStep(&request));
             allSteps[1].reset(new HeadersStep(&request));
             allSteps[2].reset(new BodyStep(&request));
@@ -694,6 +737,7 @@ namespace Private {
 
         Parser(const char* data, size_t len)
             : ParserBase()
+            , request()
         {
             allSteps[0].reset(new RequestLineStep(&request));
             allSteps[1].reset(new HeadersStep(&request));
@@ -714,9 +758,11 @@ namespace Private {
         Request request;
     };
 
-    template<> struct Parser<Http::Response> : public ParserBase {
+    template<> class Parser<Http::Response> : public ParserBase {
+    public:
         Parser()
             : ParserBase()
+            , response()
         {
             allSteps[0].reset(new ResponseLineStep(&response));
             allSteps[1].reset(new HeadersStep(&response));
@@ -725,6 +771,7 @@ namespace Private {
 
         Parser(const char* data, size_t len)
             : ParserBase()
+            , response()
         {
             allSteps[0].reset(new ResponseLineStep(&response));
             allSteps[1].reset(new HeadersStep(&response));
@@ -749,6 +796,8 @@ public:
 
     virtual void onTimeout(const Request& request, ResponseWriter response);
 
+    virtual ~Handler() { }
+
 private:
     Private::Parser<Http::Request>& getParser(const std::shared_ptr<Tcp::Peer>& peer) const;
 };
@@ -761,5 +810,12 @@ std::shared_ptr<H> make_handler(Args&& ...args) {
     return std::make_shared<H>(std::forward<Args>(args)...);
 }
 
+namespace helpers
+{
+    inline Address httpAddr(const StringView& view) {
+        auto const str = view.toString();
+        return Address(str);
+        }
+} // namespace helpers
 } // namespace Http
 } // namespace Pistache

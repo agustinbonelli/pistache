@@ -1,5 +1,8 @@
 #include "gtest/gtest.h"
 
+#include <pistache/async.h>
+#include <pistache/common.h>
+
 #include <thread>
 #include <algorithm>
 #include <deque>
@@ -7,14 +10,13 @@
 #include <condition_variable>
 #include <random>
 
-#include <pistache/async.h>
-
 using namespace Pistache;
 
 Async::Promise<int> doAsync(int N)
 {
     Async::Promise<int> promise(
         [=](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             std::thread thr([=](Async::Resolver resolve) mutable {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 resolve(N * 2);
@@ -31,6 +33,7 @@ Async::Promise<T> doAsyncTimed(std::chrono::seconds time, T val, Func func)
 {
     Async::Promise<T> promise(
         [=](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             std::thread thr([=](Async::Resolver resolve) mutable {
                 std::this_thread::sleep_for(time);
                 resolve(func(val));
@@ -46,6 +49,7 @@ Async::Promise<T> doAsyncTimed(std::chrono::seconds time, T val, Func func)
 TEST(async_test, basic_test) {
     Async::Promise<int> p1(
         [](Async::Resolver& resolv, Async::Rejection& reject) {
+            UNUSED(reject)
             resolv(10);
     });
 
@@ -66,6 +70,7 @@ TEST(async_test, basic_test) {
 
     Async::Promise<int> p3(
         [](Async::Resolver& resolv, Async::Rejection& reject) {
+            UNUSED(resolv)
             reject(std::runtime_error("Because I decided"));
     });
 
@@ -87,6 +92,7 @@ TEST(async_test, basic_test) {
 TEST(async_test, error_test) {
     Async::Promise<int> p1(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             ASSERT_THROW(resolve(10.5), Async::BadType);
     });
 }
@@ -94,8 +100,9 @@ TEST(async_test, error_test) {
 TEST(async_test, void_promise) {
     Async::Promise<void> p1(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             resolve();
-    }); 
+    });
 
     ASSERT_TRUE(p1.isFulfilled());
 
@@ -108,11 +115,13 @@ TEST(async_test, void_promise) {
 
     Async::Promise<int> p2(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             ASSERT_THROW(resolve(), Async::Error);
     });
 
     Async::Promise<void> p3(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             ASSERT_THROW(resolve(10), Async::Error);
     });
 }
@@ -120,6 +129,7 @@ TEST(async_test, void_promise) {
 TEST(async_test, chain_test) {
     Async::Promise<int> p1(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             resolve(10);
     });
 
@@ -130,6 +140,7 @@ TEST(async_test, chain_test) {
 
     Async::Promise<int> p2(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             resolve(10);
     });
 
@@ -142,13 +153,15 @@ TEST(async_test, chain_test) {
 
     Async::Promise<Test> p3(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             resolve(Test::Foo);
     });
 
     p3
         .then([](Test result) {
             return Async::Promise<std::string>(
-                [=](Async::Resolver& resolve, Async::Rejection&) {
+                [=](Async::Resolver& resolve, Async::Rejection& reject) {
+                    UNUSED(reject)
                     switch (result) {
                         case Test::Foo:
                             resolve(std::string("Foo"));
@@ -163,6 +176,7 @@ TEST(async_test, chain_test) {
 
     Async::Promise<Test> p4(
         [](Async::Resolver& resolve, Async::Rejection& reject) {
+            UNUSED(reject)
             resolve(Test::Bar);
     });
 
@@ -178,11 +192,12 @@ TEST(async_test, chain_test) {
                         case Test::Bar:
                             reject(std::runtime_error("Invalid"));
                     }
-            }); 
+            });
         },
             Async::NoExcept)
         .then(
         [](std::string str) {
+            UNUSED(str)
             ASSERT_TRUE(false);
         },
         [](std::exception_ptr exc) {
@@ -227,7 +242,7 @@ TEST(async_test, when_all) {
 
     Async::whenAll(std::begin(vec), std::end(vec)).then([&](const std::vector<int>& results) {
         resolved = true;
-        ASSERT_EQ(results.size(), 2);
+        ASSERT_EQ(results.size(), 2U);
         ASSERT_EQ(results[0], 10);
         ASSERT_EQ(results[1], 123);
     },
@@ -291,6 +306,7 @@ TEST(async_test, when_any) {
 
 TEST(async_test, rethrow_test) {
     auto p1 = Async::Promise<void>([](Async::Resolver& resolve, Async::Rejection& reject) {
+        UNUSED(resolve)
         reject(std::runtime_error("Because"));
     });
 
@@ -375,10 +391,9 @@ private:
         {
         }
 
-        int seq;
-
         Async::Resolver resolve;
         Async::Rejection reject;
+        int seq;
     };
 
     std::atomic<bool> shutdown;
@@ -417,6 +432,7 @@ TEST(async_test, stress_multithreaded_test) {
     for (size_t i = 0; i < Ops; ++i) {
         auto &wrk = workers[wrkIndex];
         wrk->doWork(i).then([&](int seq) {
+            UNUSED(seq)
             ++resolved;
         }, Async::NoExcept);
 

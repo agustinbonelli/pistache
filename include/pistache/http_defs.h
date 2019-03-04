@@ -1,6 +1,6 @@
 /* http_defs.h
    Mathieu Stefani, 01 September 2015
-   
+
    Various http definitions
 */
 
@@ -10,7 +10,6 @@
 #include <ostream>
 #include <stdexcept>
 #include <chrono>
-#include <ctime>
 #include <functional>
 
 namespace Pistache {
@@ -32,6 +31,7 @@ namespace Http {
     CODE(100, Continue, "Continue") \
     CODE(101, Switching_Protocols, "Switching Protocols") \
     CODE(102, Processing, "Processing") \
+    CODE(103, Early_Hints, "Early Hints") \
     CODE(200, Ok, "OK") \
     CODE(201, Created, "Created") \
     CODE(202, Accepted, "Accepted") \
@@ -119,8 +119,10 @@ namespace Http {
     CHARSET(Utf32-LE, "utf-32le") \
     CHARSET(Unicode-11, "unicode-1-1")
 
+const uint16_t HTTP_STANDARD_PORT = 80;
+
 enum class Method {
-#define METHOD(m, _) m, 
+#define METHOD(m, _) m,
     HTTP_METHODS
 #undef METHOD
 };
@@ -154,7 +156,11 @@ public:
                      Public, Private, MustRevalidate, ProxyRevalidate, SMaxAge,
                      Ext };
 
-    CacheDirective() { }
+    CacheDirective()
+        : directive_()
+        , data()
+    { }
+
     CacheDirective(Directive directive);
     CacheDirective(Directive directive, std::chrono::seconds delta);
 
@@ -166,17 +172,20 @@ private:
     Directive directive_;
     // Poor way of representing tagged unions in C++
     union {
-        struct { uint64_t maxAge; };
-        struct { uint64_t sMaxAge; };
-        struct { uint64_t maxStale; };
-        struct { uint64_t minFresh; };
+        uint64_t maxAge;
+        uint64_t sMaxAge;
+        uint64_t maxStale;
+        uint64_t minFresh;
     } data;
 };
 
 // 3.3.1 Full Date
 class FullDate {
 public:
-    FullDate();
+    using time_point = std::chrono::system_clock::time_point;
+    FullDate()
+       : date_()
+    { }
 
     enum class Type {
         RFC1123,
@@ -184,18 +193,17 @@ public:
         AscTime
     };
 
-    FullDate(std::tm date)
+    FullDate(time_point date)
         : date_(date)
     { }
 
-    std::tm date() const { return date_; }
+    time_point date() const { return date_; }
     void write(std::ostream& os, Type type = Type::RFC1123) const;
 
-    static FullDate fromRaw(const char* str, size_t len);
     static FullDate fromString(const std::string& str);
 
 private:
-    std::tm date_;
+    time_point date_;
 };
 
 const char* methodString(Method method);
